@@ -832,58 +832,50 @@ Use double newlines between timestamps!`;
         break;
 
       case 'select_mode':
-        // Select Gemini mode (Deep Research, etc) - use coordinates to click
+        // Select Gemini mode (Deep Research, Canvas, etc)
+        // Uses menuitemcheckbox with aria-checked to detect active state
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: async (modeName) => {
-            const allBtns = Array.from(document.querySelectorAll('button'));
             const debug = {};
 
-            // Find Tools button
-            let toolsBtn = allBtns.find(b => b.textContent?.trim() === 'Tools');
-            if (!toolsBtn) {
-              return { error: 'Tools button not found' };
-            }
+            // Step 1: Open Tools menu
+            let toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+            if (!toolsBtn) return { error: 'Tools button not found' };
 
             toolsBtn.click();
             await new Promise(r => setTimeout(r, 800));
 
-            // Find "Deep Research" text element (leaf node)
-            const allElements = document.querySelectorAll('*');
-            let textEl = null;
-
-            for (const el of allElements) {
-              if (el.textContent?.trim() === 'Deep Research' && el.children.length === 0) {
-                textEl = el;
+            // Step 2: Find all menuitemcheckbox buttons and deselect any that are checked
+            const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
+            for (const item of menuItems) {
+              if (item.getAttribute('aria-checked') === 'true') {
+                debug.deselected = item.textContent?.trim().split('\n')[0];
+                item.click();
+                await new Promise(r => setTimeout(r, 500));
+                // Re-open Tools menu
+                toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+                if (toolsBtn) {
+                  toolsBtn.click();
+                  await new Promise(r => setTimeout(r, 800));
+                }
                 break;
               }
             }
 
-            if (!textEl) {
-              return { error: 'Deep Research text not found' };
+            // Step 3: Find and click the target mode by matching menuitemcheckbox text
+            const items = document.querySelectorAll('[role="menuitemcheckbox"]');
+            for (const item of items) {
+              const text = item.textContent?.trim();
+              if (text?.includes(modeName)) {
+                item.click();
+                debug.clicked = { tag: item.tagName, text: text.substring(0, 50) };
+                console.log('[Claude Proxy] Selected mode:', modeName);
+                return { success: true, mode: modeName, debug };
+              }
             }
 
-            // Get bounding rect and click at center
-            const rect = textEl.getBoundingClientRect();
-            const x = rect.left + rect.width / 2;
-            const y = rect.top + rect.height / 2;
-
-            debug.rect = { x, y };
-
-            const clickTarget = document.elementFromPoint(x, y);
-            debug.clickTarget = { tag: clickTarget?.tagName, class: clickTarget?.className?.substring(0, 50) };
-
-            if (clickTarget) {
-              const eventInit = { bubbles: true, cancelable: true, clientX: x, clientY: y };
-              clickTarget.dispatchEvent(new MouseEvent('mousedown', eventInit));
-              clickTarget.dispatchEvent(new MouseEvent('mouseup', eventInit));
-              clickTarget.dispatchEvent(new MouseEvent('click', eventInit));
-
-              console.log('[Claude Proxy] Clicked at', x, y, clickTarget.tagName);
-              return { success: true, mode: 'Deep Research', debug };
-            }
-
-            return { error: 'No element at coordinates', debug };
+            return { error: modeName + ' not found in menu', debug };
           },
           args: [command.mode || 'Deep Research']
         });
@@ -1092,56 +1084,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.scripting.executeScript({
       target: { tabId },
       func: async (modeName) => {
-        const allBtns = Array.from(document.querySelectorAll('button'));
         const debug = {};
 
-        // Find Tools button
-        let toolsBtn = allBtns.find(b => b.textContent?.trim() === 'Tools');
-        if (!toolsBtn) {
-          return { error: 'Tools button not found' };
-        }
+        // Step 1: Open Tools menu
+        let toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+        if (!toolsBtn) return { error: 'Tools button not found' };
 
         toolsBtn.click();
         await new Promise(r => setTimeout(r, 800));
 
-        // Find "Deep Research" text element
-        const allElements = document.querySelectorAll('*');
-        let textEl = null;
-
-        for (const el of allElements) {
-          if (el.textContent?.trim() === 'Deep Research' && el.children.length === 0) {
-            textEl = el;
+        // Step 2: Deselect any checked menuitemcheckbox first
+        const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
+        for (const item of menuItems) {
+          if (item.getAttribute('aria-checked') === 'true') {
+            debug.deselected = item.textContent?.trim().split('\n')[0];
+            item.click();
+            await new Promise(r => setTimeout(r, 500));
+            toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+            if (toolsBtn) {
+              toolsBtn.click();
+              await new Promise(r => setTimeout(r, 800));
+            }
             break;
           }
         }
 
-        if (!textEl) {
-          return { error: 'Deep Research text not found' };
+        // Step 3: Click target mode
+        const items = document.querySelectorAll('[role="menuitemcheckbox"]');
+        for (const item of items) {
+          if (item.textContent?.trim().includes(modeName)) {
+            item.click();
+            debug.clicked = { tag: item.tagName, text: item.textContent?.trim().substring(0, 50) };
+            return { success: true, mode: modeName, debug };
+          }
         }
 
-        // Get bounding rect and click at center using elementFromPoint
-        const rect = textEl.getBoundingClientRect();
-        const x = rect.left + rect.width / 2;
-        const y = rect.top + rect.height / 2;
-
-        debug.rect = { x, y, width: rect.width, height: rect.height };
-
-        // Find element at that point and click it
-        const clickTarget = document.elementFromPoint(x, y);
-        debug.clickTarget = { tag: clickTarget?.tagName, class: clickTarget?.className?.substring(0, 50) };
-
-        if (clickTarget) {
-          // Dispatch full mouse event sequence
-          const eventInit = { bubbles: true, cancelable: true, clientX: x, clientY: y };
-          clickTarget.dispatchEvent(new MouseEvent('mousedown', eventInit));
-          clickTarget.dispatchEvent(new MouseEvent('mouseup', eventInit));
-          clickTarget.dispatchEvent(new MouseEvent('click', eventInit));
-
-          console.log('[Claude Proxy] Clicked at', x, y, clickTarget.tagName);
-          return { success: true, mode: 'Deep Research', debug };
-        }
-
-        return { error: 'No element at coordinates', debug };
+        return { error: modeName + ' not found in menu', debug };
       },
       args: [msg.mode || 'Deep Research']
     }).then(results => {

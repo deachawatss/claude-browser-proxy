@@ -94,6 +94,8 @@
         <button class="btn-model" onclick="selectModel('fast')">⚡ Fast</button>
         <button class="btn-model" onclick="selectModel('pro')">🧠 Pro</button>
         <button class="btn-model" onclick="selectModel('thinking')">💭 Think</button>
+        <button style="background:#f59e0b;color:#000;" onclick="selectMode('Deep Research')">🔬 Deep Research</button>
+        <button style="background:#06b6d4;color:#000;" onclick="selectMode('Canvas')">🎨 Canvas</button>
       </div>
 
       <div class="btn-row">
@@ -260,6 +262,10 @@
 
     function selectModel(model) {
       send({ action: 'select_model', model: model });
+    }
+
+    function selectMode(mode) {
+      send({ action: 'select_mode', mode: mode });
     }
 
     function sendChat() {
