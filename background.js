@@ -1084,7 +1084,7 @@ Use double newlines between timestamps!`;
             const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
             if (!log) throw new Error('No open conversation found');
 
-            const articles = Array.from(log.querySelectorAll('article'));
+            const articles = Array.from(log.querySelectorAll('[role="article"]'));
             const parsed = [];
             articles.forEach(article => {
               const labeled = article.querySelector('[aria-label^="At "]') ||
@@ -1093,7 +1093,7 @@ Use double newlines between timestamps!`;
               let text = '';
               if (labeled) {
                 const label = labeled.getAttribute('aria-label') || '';
-                const m = label.match(/^At [^,]+,\s*([^:]+?)(?::\s*(.*))?$/);
+                const m = label.match(/^At .*?\d{1,2}:\d{2}(?:\s*[AP]M)?,\s*([^:]*?)(?::\s*(.*))?$/si);
                 if (m) {
                   sender = m[1].trim();
                   text = (m[2] || '').trim();
@@ -1162,7 +1162,7 @@ Use double newlines between timestamps!`;
 
             const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
             if (log && threadId) {
-              const articles = log.querySelectorAll('article');
+              const articles = log.querySelectorAll('[role="article"]');
               const lastArticle = articles[articles.length - 1];
               if (lastArticle) {
                 const labeled = lastArticle.querySelector('[aria-label^="At "]') ||
@@ -1171,7 +1171,7 @@ Use double newlines between timestamps!`;
                 let text = '';
                 if (labeled) {
                   const label = labeled.getAttribute('aria-label') || '';
-                  const m = label.match(/^At [^,]+,\s*([^:]+?)(?::\s*(.*))?$/);
+                  const m = label.match(/^At .*?\d{1,2}:\d{2}(?:\s*[AP]M)?,\s*([^:]*?)(?::\s*(.*))?$/si);
                   if (m) {
                     sender = m[1].trim();
                     text = (m[2] || '').trim();
@@ -1221,7 +1221,7 @@ Use double newlines between timestamps!`;
             const entry = stored[key] || { hashes: {} };
 
             const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
-            const articles = log ? Array.from(log.querySelectorAll('article')) : [];
+            const articles = log ? Array.from(log.querySelectorAll('[role="article"]')) : [];
             const recentArticles = articles.slice(-limit);
 
             const messages = [];
@@ -1233,7 +1233,7 @@ Use double newlines between timestamps!`;
               let approxTime = null;
               if (labeled) {
                 const label = labeled.getAttribute('aria-label') || '';
-                const m = label.match(/^At ([^,]+),\s*([^:]+?)(?::\s*(.*))?$/);
+                const m = label.match(/^At (.*?\d{1,2}:\d{2}(?:\s*[AP]M)?),\s*([^:]*?)(?::\s*(.*))?$/si);
                 if (m) {
                   approxTime = m[1].trim();
                   sender = m[2].trim();
@@ -1493,7 +1493,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
         if (!log) return { error: 'No open conversation found', threadId: targetThreadId };
 
-        const articles = Array.from(log.querySelectorAll('article'));
+        const articles = Array.from(log.querySelectorAll('[role="article"]'));
         const parsed = [];
         articles.forEach(article => {
           const labeled = article.querySelector('[aria-label^="At "]') ||
@@ -1502,7 +1502,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           let text = '';
           if (labeled) {
             const label = labeled.getAttribute('aria-label') || '';
-            const m = label.match(/^At [^,]+,\s*([^:]+?)(?::\s*(.*))?$/);
+            const m = label.match(/^At .*?\d{1,2}:\d{2}(?:\s*[AP]M)?,\s*([^:]*?)(?::\s*(.*))?$/si);
             if (m) {
               sender = m[1].trim();
               text = (m[2] || '').trim();
