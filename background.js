@@ -3,7 +3,7 @@
 
 importScripts('mqtt.min.js');
 
-const VERSION = '2.9.39'; // Short version for badge display
+const VERSION = chrome.runtime.getManifest().version;
 const MQTT_URL = 'ws://localhost:9001';
 const TOPICS = {
   command: 'claude/browser/command',
@@ -838,36 +838,47 @@ Use double newlines between timestamps!`;
           target: { tabId: tab.id },
           func: async (modeName) => {
             const debug = {};
+            const findTools = () => Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
 
             // Step 1: Open Tools menu
-            let toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+            let toolsBtn = findTools();
             if (!toolsBtn) return { error: 'Tools button not found' };
 
             toolsBtn.click();
             await new Promise(r => setTimeout(r, 800));
 
-            // Step 2: Find all menuitemcheckbox buttons and deselect any that are checked
+            // Step 2: Check if target is already active (toggle off) or deselect other mode
             const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
             for (const item of menuItems) {
               if (item.getAttribute('aria-checked') === 'true') {
-                debug.deselected = item.textContent?.trim().split('\n')[0];
+                const checkedName = item.textContent?.trim().split('\n')[0]?.trim();
+                debug.deselected = checkedName;
                 item.click();
-                await new Promise(r => setTimeout(r, 500));
-                // Re-open Tools menu
-                toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
-                if (toolsBtn) {
-                  toolsBtn.click();
-                  await new Promise(r => setTimeout(r, 800));
+                await new Promise(r => setTimeout(r, 1000));
+
+                // If toggling off the same mode, we're done
+                if (checkedName === modeName) {
+                  console.log('[Claude Proxy] Toggled off mode:', modeName);
+                  return { success: true, mode: modeName, toggled: 'off', debug };
                 }
+
+                // Otherwise, re-open Tools to select the new mode
+                await new Promise(r => setTimeout(r, 500));
+                toolsBtn = findTools();
+                if (!toolsBtn) return { error: 'Tools button not found after deselect', debug };
+                toolsBtn.click();
+                await new Promise(r => setTimeout(r, 1000));
                 break;
               }
             }
 
-            // Step 3: Find and click the target mode by matching menuitemcheckbox text
+            // Step 3: Find and click the target mode by matching first line of text
             const items = document.querySelectorAll('[role="menuitemcheckbox"]');
+            debug.menuItems = Array.from(items).map(i => i.textContent?.trim().split('\n')[0]?.trim());
             for (const item of items) {
               const text = item.textContent?.trim();
-              if (text?.includes(modeName)) {
+              const firstLine = text?.split('\n')[0]?.trim();
+              if (firstLine === modeName) {
                 item.click();
                 debug.clicked = { tag: item.tagName, text: text.substring(0, 50) };
                 console.log('[Claude Proxy] Selected mode:', modeName);
@@ -1085,36 +1096,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       target: { tabId },
       func: async (modeName) => {
         const debug = {};
+        const findTools = () => Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
 
         // Step 1: Open Tools menu
-        let toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+        let toolsBtn = findTools();
         if (!toolsBtn) return { error: 'Tools button not found' };
 
         toolsBtn.click();
         await new Promise(r => setTimeout(r, 800));
 
-        // Step 2: Deselect any checked menuitemcheckbox first
+        // Step 2: Check if target is already active (toggle off) or deselect other mode
         const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
         for (const item of menuItems) {
           if (item.getAttribute('aria-checked') === 'true') {
-            debug.deselected = item.textContent?.trim().split('\n')[0];
+            const checkedName = item.textContent?.trim().split('\n')[0]?.trim();
+            debug.deselected = checkedName;
             item.click();
-            await new Promise(r => setTimeout(r, 500));
-            toolsBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
-            if (toolsBtn) {
-              toolsBtn.click();
-              await new Promise(r => setTimeout(r, 800));
+            await new Promise(r => setTimeout(r, 1000));
+
+            // If toggling off the same mode, we're done
+            if (checkedName === modeName) {
+              return { success: true, mode: modeName, toggled: 'off', debug };
             }
+
+            // Otherwise, re-open Tools to select the new mode
+            // Wait for DOM to settle after deselection
+            await new Promise(r => setTimeout(r, 500));
+            toolsBtn = findTools();
+            if (!toolsBtn) return { error: 'Tools button not found after deselect', debug };
+            toolsBtn.click();
+            await new Promise(r => setTimeout(r, 1000));
             break;
           }
         }
 
-        // Step 3: Click target mode
+        // Step 3: Click target mode by matching first line of text
         const items = document.querySelectorAll('[role="menuitemcheckbox"]');
+        debug.menuItems = Array.from(items).map(i => i.textContent?.trim().split('\n')[0]?.trim());
         for (const item of items) {
-          if (item.textContent?.trim().includes(modeName)) {
+          const text = item.textContent?.trim();
+          const firstLine = text?.split('\n')[0]?.trim();
+          if (firstLine === modeName) {
             item.click();
-            debug.clicked = { tag: item.tagName, text: item.textContent?.trim().substring(0, 50) };
+            debug.clicked = { tag: item.tagName, text: text?.substring(0, 50) };
             return { success: true, mode: modeName, debug };
           }
         }

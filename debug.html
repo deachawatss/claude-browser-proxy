@@ -112,6 +112,7 @@
       <div class="input-row">
         <input type="text" id="chatInput" placeholder="Type message to send to Gemini..." />
         <button class="btn-action" onclick="sendChat()">Send Chat</button>
+        <button style="background:#06b6d4;color:#000;font-weight:600;" onclick="canvasChat()">🎨 Canvas Chat</button>
       </div>
 
       <div class="input-row">
@@ -274,6 +275,17 @@
         send({ action: 'chat', text: text });
         document.getElementById('chatInput').value = '';
       }
+    }
+
+    function canvasChat() {
+      const text = document.getElementById('chatInput').value;
+      if (!text) { alert('Type a message first'); return; }
+      // Select Canvas mode, wait for it, then send chat
+      send({ action: 'select_mode', mode: 'Canvas' });
+      document.getElementById('chatInput').value = '';
+      setTimeout(() => {
+        send({ action: 'chat', text: text });
+      }, 4000);
     }
 
     function clickSelector() {

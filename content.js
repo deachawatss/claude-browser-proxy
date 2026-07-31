@@ -290,27 +290,65 @@ function injectInputAreaButtons(tabId) {
   sep.style.cssText = 'color:#555;font-size:14px;padding:0 4px;user-select:none;';
   container.appendChild(sep);
 
-  // Add Deep Research button - uses select_mode action via background
+  // Mode button styles
+  const modeDefault = 'background:transparent;border:1px solid #555;color:#9aa0a6;cursor:pointer;font-size:14px;padding:4px 8px;border-radius:16px;opacity:0.8;transition:all 0.2s;';
+  const modeActiveStyles = {
+    'Deep Research': 'background:#f59e0b;border:1px solid #f59e0b;color:#000;cursor:pointer;font-size:14px;padding:4px 8px;border-radius:16px;opacity:1;transition:all 0.2s;font-weight:bold;',
+    'Canvas': 'background:#06b6d4;border:1px solid #06b6d4;color:#000;cursor:pointer;font-size:14px;padding:4px 8px;border-radius:16px;opacity:1;transition:all 0.2s;font-weight:bold;'
+  };
+
+  function setModeActive(activeMode) {
+    researchBtn.style.cssText = activeMode === 'Deep Research' ? modeActiveStyles['Deep Research'] : modeDefault;
+    canvasBtn.style.cssText = activeMode === 'Canvas' ? modeActiveStyles['Canvas'] : modeDefault;
+  }
+
+  // Add Deep Research button
   const researchBtn = document.createElement('button');
   researchBtn.textContent = '🔬';
   researchBtn.title = 'Deep Research';
-  researchBtn.style.cssText = 'background:transparent;border:1px solid #555;color:#9aa0a6;cursor:pointer;font-size:14px;padding:4px 8px;border-radius:16px;opacity:0.8;transition:all 0.2s;';
-  researchBtn.onmouseenter = () => { researchBtn.style.opacity = '1'; researchBtn.style.borderColor = '#888'; };
-  researchBtn.onmouseleave = () => { researchBtn.style.opacity = '0.8'; researchBtn.style.borderColor = '#555'; };
+  researchBtn.style.cssText = modeDefault;
   researchBtn.onclick = () => {
-    showToast('🔄 Switching to Deep Research...');
+    const wasActive = researchBtn.style.background === 'rgb(245, 158, 11)';
+    setModeActive(wasActive ? null : 'Deep Research');
+    showToast(wasActive ? '🔄 Deselecting Deep Research...' : '🔄 Switching to Deep Research...');
     chrome.runtime.sendMessage({
       action: 'select_mode',
       mode: 'Deep Research'
     }, (response) => {
       if (response?.success) {
-        showToast('✅ Deep Research');
+        showToast(response.toggled === 'off' ? '✅ Deep Research off' : '✅ Deep Research');
+        if (response.toggled === 'off') setModeActive(null);
       } else {
         showToast('⚠️ ' + (response?.error || 'Failed'));
+        setModeActive(null);
       }
     });
   };
   container.appendChild(researchBtn);
+
+  // Add Canvas button
+  const canvasBtn = document.createElement('button');
+  canvasBtn.textContent = '🎨';
+  canvasBtn.title = 'Canvas';
+  canvasBtn.style.cssText = modeDefault;
+  canvasBtn.onclick = () => {
+    const wasActive = canvasBtn.style.background === 'rgb(6, 182, 212)';
+    setModeActive(wasActive ? null : 'Canvas');
+    showToast(wasActive ? '🔄 Deselecting Canvas...' : '🔄 Switching to Canvas...');
+    chrome.runtime.sendMessage({
+      action: 'select_mode',
+      mode: 'Canvas'
+    }, (response) => {
+      if (response?.success) {
+        showToast(response.toggled === 'off' ? '✅ Canvas off' : '✅ Canvas');
+        if (response.toggled === 'off') setModeActive(null);
+      } else {
+        showToast('⚠️ ' + (response?.error || 'Failed'));
+        setModeActive(null);
+      }
+    });
+  };
+  container.appendChild(canvasBtn);
 
   // Add TAB ID after brain
   if (tabId) {

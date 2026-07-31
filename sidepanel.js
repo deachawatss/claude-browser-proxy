@@ -261,6 +261,71 @@ document.querySelectorAll('.model-btn').forEach(btn => {
   };
 });
 
+// Mode selection buttons (Deep Research, Canvas)
+document.querySelectorAll('.mode-btn').forEach(btn => {
+  btn.onclick = async () => {
+    const mode = btn.dataset.mode;
+    const wasActive = btn.classList.contains('active');
+
+    // Toggle: if already active, deselect (turn off mode)
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    if (!wasActive) btn.classList.add('active');
+
+    log('cmd', '🔄 ' + (wasActive ? 'Deselecting' : 'Selecting') + ' ' + mode + '...');
+
+    try {
+      await chrome.runtime.sendMessage({
+        action: 'command',
+        command: { action: 'select_mode', mode: mode, id: 'mode_' + Date.now() }
+      });
+    } catch (e) {
+      log('res', '❌ Error: ' + e.message);
+    }
+  };
+});
+
+// New Chat button - deselect active mode + start new chat
+$('newChat').onclick = async () => {
+  log('cmd', '✨ Resetting...');
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab) {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async () => {
+          // Step 1: Deselect any active mode via Tools menu
+          const findTools = () => Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+          const toolsBtn = findTools();
+          if (toolsBtn) {
+            toolsBtn.click();
+            await new Promise(r => setTimeout(r, 800));
+            const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
+            for (const item of menuItems) {
+              if (item.getAttribute('aria-checked') === 'true') {
+                item.click();
+                await new Promise(r => setTimeout(r, 500));
+                break;
+              }
+            }
+          }
+
+          // Step 2: Click new chat button
+          await new Promise(r => setTimeout(r, 300));
+          const newBtn = document.querySelector('a[href="/app"]') ||
+            Array.from(document.querySelectorAll('button')).find(b => b.getAttribute('aria-label')?.includes('New chat'));
+          if (newBtn) { newBtn.click(); return { success: true }; }
+          window.location.href = 'https://gemini.google.com/app';
+          return { success: true, method: 'navigate' };
+        }
+      });
+      log('res', '✨ Reset & new chat');
+    }
+  } catch (e) {
+    log('res', '❌ Error: ' + e.message);
+  }
+};
+
 // Watch for MQTT logs from background (filter chat noise)
 let lastLogCount = 0;
 async function syncLogs() {
