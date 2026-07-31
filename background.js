@@ -18,6 +18,9 @@ let client = null;
 let isConnected = false;
 let connectedAt = 0; // Track connection time to ignore stale retained messages
 
+// Actions routed to a Messenger tab instead of a Gemini tab
+const MESSENGER_ACTIONS = new Set(['list_chats', 'index_chat', 'get_index_status', 'read_chat']);
+
 // Connect to MQTT broker with LWT
 function connect() {
   console.log('[MQTT] Connecting to', MQTT_URL);
@@ -462,6 +465,18 @@ Use double newlines between timestamps!`;
         },
         args: [tab.id]
       });
+    } else if (MESSENGER_ACTIONS.has(command.action)) {
+      // Find most recently active Messenger tab
+      const messengerTabs = await chrome.tabs.query({
+        url: ['https://www.facebook.com/messages/*', 'https://www.messenger.com/*']
+      });
+      if (messengerTabs.length > 0) {
+        messengerTabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+        tab = messengerTabs[0];
+      }
+      if (!tab) {
+        [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      }
     } else {
       // Find most recently active Gemini tab
       const geminiTabs = await chrome.tabs.query({ url: 'https://gemini.google.com/*' });
@@ -476,7 +491,12 @@ Use double newlines between timestamps!`;
     }
 
     if (!tab) throw new Error('No tab found');
-    if (!tab.url?.includes('gemini.google.com')) {
+
+    if (MESSENGER_ACTIONS.has(command.action)) {
+      if (!tab.url?.includes('facebook.com/messages') && !tab.url?.includes('messenger.com')) {
+        throw new Error('Tab is not Messenger. Please open facebook.com/messages or messenger.com');
+      }
+    } else if (!tab.url?.includes('gemini.google.com')) {
       throw new Error('Tab is not Gemini. Please open gemini.google.com or use create_tab');
     }
 
@@ -987,6 +1007,240 @@ Use double newlines between timestamps!`;
         result = result[0]?.result || { error: 'Script returned null' };
         break;
 
+      // === MESSENGER TAB ACTIONS ===
+      case 'list_chats':
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            const grid = document.querySelector('[role="grid"][aria-label="Chats"]');
+            if (!grid) return { chats: [] };
+            const rows = grid.querySelectorAll('[role="row"]');
+            const chats = [];
+            rows.forEach(row => {
+              const link = row.querySelector('[role="gridcell"] a');
+              if (!link) return;
+              const href = link.getAttribute('href') || '';
+              const match = href.match(/\/messages\/(?:e2ee\/)?t\/([0-9]+)\//);
+              const threadId = match ? match[1] : null;
+              if (!threadId) return;
+
+              const leaves = Array.from(link.querySelectorAll('*'))
+                .filter(el => el.children.length === 0 && el.textContent && el.textContent.trim().length > 0)
+                .map(el => el.textContent.trim());
+
+              let name = link.getAttribute('aria-label') || '';
+              const timeRegex = /^\d+\s?(s|m|h|d|w|min|hr|hrs)$|^Yesterday$|^\d{1,2}:\d{2}/;
+              const timeAgo = leaves.find(t => timeRegex.test(t)) || '';
+              if (!name) {
+                name = leaves.find(t => t !== timeAgo) || '';
+              }
+              const preview = leaves.find(t => t !== name && t !== timeAgo) || '';
+
+              chats.push({ threadId, name, href, preview, timeAgo });
+            });
+            return { chats };
+          }
+        });
+        result = result[0]?.result;
+        break;
+
+      case 'index_chat':
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async (paramThreadId) => {
+            async function hashMessage(threadId, sender, text) {
+              const enc = new TextEncoder().encode(threadId + '|' + sender + '|' + text);
+              const digest = await crypto.subtle.digest('SHA-256', enc);
+              return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+            }
+
+            let threadId = paramThreadId;
+            if (!threadId) {
+              const m = location.href.match(/\/messages\/(?:e2ee\/)?t\/([0-9]+)\//);
+              threadId = m ? m[1] : null;
+            }
+            if (!threadId) throw new Error('Could not determine threadId');
+
+            const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
+            if (!log) throw new Error('No open conversation found');
+
+            const articles = Array.from(log.querySelectorAll('article'));
+            const parsed = [];
+            articles.forEach(article => {
+              const labeled = article.querySelector('[aria-label^="At "]') ||
+                (article.getAttribute('aria-label')?.startsWith('At ') ? article : null);
+              let sender = '';
+              let text = '';
+              if (labeled) {
+                const label = labeled.getAttribute('aria-label') || '';
+                const m = label.match(/^At [^,]+,\s*([^:]+?)(?::\s*(.*))?$/);
+                if (m) {
+                  sender = m[1].trim();
+                  text = (m[2] || '').trim();
+                }
+              }
+              if (!sender) {
+                sender = 'unknown';
+                text = article.textContent ? article.textContent.trim() : '';
+              }
+              parsed.push({ sender, text });
+            });
+
+            const key = 'msgIndex:' + threadId;
+            const stored = await chrome.storage.local.get(key);
+            const entry = stored[key] || { hashes: {}, lastIndexedAt: 0 };
+
+            let newlyIndexed = 0;
+            for (const { sender, text } of parsed) {
+              const hash = await hashMessage(threadId, sender, text);
+              if (!entry.hashes[hash]) {
+                entry.hashes[hash] = {
+                  sender,
+                  textPreview: text.slice(0, 200),
+                  indexedAt: Date.now()
+                };
+                newlyIndexed++;
+              }
+            }
+            entry.lastIndexedAt = Date.now();
+
+            await chrome.storage.local.set({ [key]: entry });
+
+            return {
+              threadId,
+              newlyIndexed,
+              totalIndexed: Object.keys(entry.hashes).length
+            };
+          },
+          args: [command.threadId || null]
+        });
+        result = result[0]?.result;
+        break;
+
+      case 'get_index_status':
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async (paramThreadId) => {
+            async function hashMessage(threadId, sender, text) {
+              const enc = new TextEncoder().encode(threadId + '|' + sender + '|' + text);
+              const digest = await crypto.subtle.digest('SHA-256', enc);
+              return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+            }
+
+            let threadId = paramThreadId;
+            if (!threadId) {
+              const m = location.href.match(/\/messages\/(?:e2ee\/)?t\/([0-9]+)\//);
+              threadId = m ? m[1] : null;
+            }
+
+            const key = threadId ? 'msgIndex:' + threadId : null;
+            const stored = key ? await chrome.storage.local.get(key) : {};
+            const entry = (key && stored[key]) || { hashes: {}, lastIndexedAt: 0 };
+
+            let latestMessageHash = null;
+            let latestMessageIndexed = false;
+
+            const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
+            if (log && threadId) {
+              const articles = log.querySelectorAll('article');
+              const lastArticle = articles[articles.length - 1];
+              if (lastArticle) {
+                const labeled = lastArticle.querySelector('[aria-label^="At "]') ||
+                  (lastArticle.getAttribute('aria-label')?.startsWith('At ') ? lastArticle : null);
+                let sender = '';
+                let text = '';
+                if (labeled) {
+                  const label = labeled.getAttribute('aria-label') || '';
+                  const m = label.match(/^At [^,]+,\s*([^:]+?)(?::\s*(.*))?$/);
+                  if (m) {
+                    sender = m[1].trim();
+                    text = (m[2] || '').trim();
+                  }
+                }
+                if (!sender) {
+                  sender = 'unknown';
+                  text = lastArticle.textContent ? lastArticle.textContent.trim() : '';
+                }
+                latestMessageHash = await hashMessage(threadId, sender, text);
+                latestMessageIndexed = !!entry.hashes[latestMessageHash];
+              }
+            }
+
+            return {
+              threadId: threadId || null,
+              totalIndexed: Object.keys(entry.hashes).length,
+              lastIndexedAt: entry.lastIndexedAt || 0,
+              latestMessageHash,
+              latestMessageIndexed
+            };
+          },
+          args: [command.threadId || null]
+        });
+        result = result[0]?.result;
+        break;
+
+      case 'read_chat':
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async (paramThreadId, limit) => {
+            async function hashMessage(threadId, sender, text) {
+              const enc = new TextEncoder().encode(threadId + '|' + sender + '|' + text);
+              const digest = await crypto.subtle.digest('SHA-256', enc);
+              return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+            }
+
+            let threadId = paramThreadId;
+            if (!threadId) {
+              const m = location.href.match(/\/messages\/(?:e2ee\/)?t\/([0-9]+)\//);
+              threadId = m ? m[1] : null;
+            }
+            if (!threadId) throw new Error('Could not determine threadId');
+
+            const key = 'msgIndex:' + threadId;
+            const stored = await chrome.storage.local.get(key);
+            const entry = stored[key] || { hashes: {} };
+
+            const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
+            const articles = log ? Array.from(log.querySelectorAll('article')) : [];
+            const recentArticles = articles.slice(-limit);
+
+            const messages = [];
+            for (const article of recentArticles) {
+              const labeled = article.querySelector('[aria-label^="At "]') ||
+                (article.getAttribute('aria-label')?.startsWith('At ') ? article : null);
+              let sender = '';
+              let text = '';
+              let approxTime = null;
+              if (labeled) {
+                const label = labeled.getAttribute('aria-label') || '';
+                const m = label.match(/^At ([^,]+),\s*([^:]+?)(?::\s*(.*))?$/);
+                if (m) {
+                  approxTime = m[1].trim();
+                  sender = m[2].trim();
+                  text = (m[3] || '').trim();
+                }
+              }
+              if (!sender) {
+                sender = 'unknown';
+                text = article.textContent ? article.textContent.trim() : '';
+              }
+              const hash = await hashMessage(threadId, sender, text);
+              messages.push({
+                hash,
+                sender,
+                text,
+                indexed: !!entry.hashes[hash],
+                approxTime
+              });
+            }
+
+            return { threadId, messages };
+          },
+          args: [command.threadId || null, command.limit || 20]
+        });
+        result = result[0]?.result;
+        break;
+
       default:
         result = { error: 'Unknown action: ' + command.action };
     }
@@ -1146,6 +1400,80 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { error: modeName + ' not found in menu', debug };
       },
       args: [msg.mode || 'Deep Research']
+    }).then(results => {
+      sendResponse(results[0]?.result || { error: 'Script failed' });
+    }).catch(e => {
+      sendResponse({ error: e.message });
+    });
+    return true;
+  } else if (msg.action === 'index_chat_request') {
+    // Fired by messenger-content.js when the user clicks a chat's status badge.
+    // Runs the same indexing logic as the 'index_chat' MQTT action, scoped to
+    // the thread the badge was clicked for (not necessarily the open thread).
+    const tabId = sender.tab?.id;
+    const threadId = msg.threadId;
+    if (!tabId || !threadId) {
+      sendResponse({ error: 'Missing tabId or threadId' });
+      return true;
+    }
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (targetThreadId) => {
+        async function hashMessage(threadId, sender, text) {
+          const enc = new TextEncoder().encode(threadId + '|' + sender + '|' + text);
+          const digest = await crypto.subtle.digest('SHA-256', enc);
+          return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+        }
+
+        const currentThreadMatch = location.href.match(/\/messages\/(?:e2ee\/)?t\/([0-9]+)\//);
+        const currentThreadId = currentThreadMatch ? currentThreadMatch[1] : null;
+        if (currentThreadId !== targetThreadId) {
+          return { error: 'Open conversation does not match clicked chat — open it first, then click again', threadId: targetThreadId };
+        }
+
+        const log = document.querySelector('[role="log"][aria-label^="Messages in conversation"]');
+        if (!log) return { error: 'No open conversation found', threadId: targetThreadId };
+
+        const articles = Array.from(log.querySelectorAll('article'));
+        const parsed = [];
+        articles.forEach(article => {
+          const labeled = article.querySelector('[aria-label^="At "]') ||
+            (article.getAttribute('aria-label')?.startsWith('At ') ? article : null);
+          let sender = '';
+          let text = '';
+          if (labeled) {
+            const label = labeled.getAttribute('aria-label') || '';
+            const m = label.match(/^At [^,]+,\s*([^:]+?)(?::\s*(.*))?$/);
+            if (m) {
+              sender = m[1].trim();
+              text = (m[2] || '').trim();
+            }
+          }
+          if (!sender) {
+            sender = 'unknown';
+            text = article.textContent ? article.textContent.trim() : '';
+          }
+          parsed.push({ sender, text });
+        });
+
+        const key = 'msgIndex:' + targetThreadId;
+        const stored = await chrome.storage.local.get(key);
+        const entry = stored[key] || { hashes: {}, lastIndexedAt: 0 };
+
+        let newlyIndexed = 0;
+        for (const { sender, text } of parsed) {
+          const hash = await hashMessage(targetThreadId, sender, text);
+          if (!entry.hashes[hash]) {
+            entry.hashes[hash] = { sender, textPreview: text.slice(0, 200), indexedAt: Date.now() };
+            newlyIndexed++;
+          }
+        }
+        entry.lastIndexedAt = Date.now();
+        await chrome.storage.local.set({ [key]: entry });
+
+        return { threadId: targetThreadId, newlyIndexed, totalIndexed: Object.keys(entry.hashes).length };
+      },
+      args: [threadId]
     }).then(results => {
       sendResponse(results[0]?.result || { error: 'Script failed' });
     }).catch(e => {

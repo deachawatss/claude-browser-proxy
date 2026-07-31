@@ -61,6 +61,23 @@ Claude Code CLI  <-->  MQTT Broker (Mosquitto)  <-->  Chrome Extension  <-->  Br
 - `execute` - Run arbitrary JavaScript
 - `get_state` - Check if Gemini is loading/responding
 
+### Messenger Integration | ใช้งาน Messenger
+
+Routed to the most recently active `facebook.com/messages/*` or `messenger.com/*` tab
+instead of Gemini. Facebook exposes no stable per-message DOM id, so messages are
+identified by a content hash (`SHA-256(threadId|sender|text)`, first 16 hex chars) stored
+in `chrome.storage.local` under `msgIndex:<threadId>` — this is an extension-owned
+indexed/not-indexed state, separate from Facebook's own read/unread.
+
+- `list_chats` - List all visible chats in the sidebar: `{ chats: [{ threadId, name, href, preview, timeAgo }] }`
+- `index_chat` - Hash + store every message currently rendered in the open conversation (params: `threadId?` — defaults to whichever chat is open). Returns `{ threadId, newlyIndexed, totalIndexed }`
+- `get_index_status` - Check index state for a chat (params: `threadId?`). Returns `{ threadId, totalIndexed, lastIndexedAt, latestMessageHash, latestMessageIndexed }`
+- `read_chat` - Read the most recent messages with their hash + indexed state (params: `threadId?`, `limit?` default 20). Returns `{ threadId, messages: [{ hash, sender, text, indexed, approxTime }] }`
+
+The chat list also gets a small status-dot badge on each avatar (🟢 indexed at least
+once / ⚪ never indexed) — click it to trigger `index_chat` for that thread directly from
+the browser, no MQTT round-trip needed. Content script: `messenger-content.js`.
+
 ## Installation | การติดตั้ง
 
 ### 1. Install Mosquitto MQTT Broker
@@ -140,6 +157,18 @@ mosquitto_pub -t "claude/browser/command" -m '{"action":"select_model","model":"
 
 # Take screenshot
 mosquitto_pub -t "claude/browser/command" -m '{"action":"screenshot"}'
+
+# List Messenger chats (open facebook.com/messages first)
+mosquitto_pub -t "claude/browser/command" -m '{"action":"list_chats"}'
+
+# Index whichever Messenger conversation is currently open
+mosquitto_pub -t "claude/browser/command" -m '{"action":"index_chat"}'
+
+# Check index status for a specific thread
+mosquitto_pub -t "claude/browser/command" -m '{"action":"get_index_status","threadId":"955645746904856"}'
+
+# Read the last 10 messages with their indexed state
+mosquitto_pub -t "claude/browser/command" -m '{"action":"read_chat","limit":10}'
 ```
 
 ### CLI Helper Script
