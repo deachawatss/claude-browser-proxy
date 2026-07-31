@@ -19,7 +19,27 @@ let isConnected = false;
 let connectedAt = 0; // Track connection time to ignore stale retained messages
 
 // Actions routed to a Messenger tab instead of a Gemini tab
-const MESSENGER_ACTIONS = new Set(['list_chats', 'index_chat', 'get_index_status', 'read_chat']);
+const MESSENGER_ACTIONS = new Set(['list_chats', 'index_chat', 'get_index_status', 'read_chat', 'send_chat_message']);
+
+// Navigate a tab and wait for it to finish loading (no existing helper in this
+// file does this — other actions either don't navigate or don't need to wait).
+function navigateAndWait(tabId, url, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('Navigation timed out: ' + url));
+    }, timeoutMs);
+    function listener(updatedTabId, changeInfo) {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.update(tabId, { url });
+  });
+}
 
 // Connect to MQTT broker with LWT
 function connect() {
@@ -1240,6 +1260,45 @@ Use double newlines between timestamps!`;
         });
         result = result[0]?.result;
         break;
+
+      case 'send_chat_message': {
+        if (!command.text) throw new Error('send_chat_message requires "text"');
+
+        // Navigate to the target thread first if it's not already open —
+        // Messenger's compose box only exists for the currently open conversation.
+        if (command.threadId) {
+          const currentMatch = tab.url?.match(/\/messages\/(?:e2ee\/)?t\/([0-9]+)\//);
+          const currentThreadId = currentMatch ? currentMatch[1] : null;
+          if (currentThreadId !== command.threadId) {
+            await navigateAndWait(tab.id, 'https://www.facebook.com/messages/t/' + command.threadId + '/');
+          }
+        }
+
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async (text) => {
+            const box = document.querySelector('[contenteditable="true"][role="textbox"]');
+            if (!box) return { error: 'Message compose box not found' };
+
+            box.focus();
+            // contenteditable boxes need execCommand/insertText (matches the
+            // approach already used for the Gemini 'chat' action in this file)
+            // rather than setting .textContent, or React's controlled-input
+            // state doesn't pick up the change.
+            document.execCommand('insertText', false, text);
+            box.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+
+            await new Promise(r => setTimeout(r, 300));
+
+            box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+
+            return { success: true, sent: text.substring(0, 80) };
+          },
+          args: [command.text]
+        });
+        result = result[0]?.result || { error: 'Script returned null' };
+        break;
+      }
 
       default:
         result = { error: 'Unknown action: ' + command.action };

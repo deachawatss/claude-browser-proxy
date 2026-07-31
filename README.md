@@ -73,6 +73,7 @@ indexed/not-indexed state, separate from Facebook's own read/unread.
 - `index_chat` - Hash + store every message currently rendered in the open conversation (params: `threadId?` — defaults to whichever chat is open). Returns `{ threadId, newlyIndexed, totalIndexed }`
 - `get_index_status` - Check index state for a chat (params: `threadId?`). Returns `{ threadId, totalIndexed, lastIndexedAt, latestMessageHash, latestMessageIndexed }`
 - `read_chat` - Read the most recent messages with their hash + indexed state (params: `threadId?`, `limit?` default 20). Returns `{ threadId, messages: [{ hash, sender, text, indexed, approxTime }] }`
+- `send_chat_message` - Send/reply to a chat (params: `text` required, `threadId?` — navigates there first if it's not the open conversation). Returns `{ success, sent }`
 
 The chat list also gets a small status-dot badge on each avatar (🟢 indexed at least
 once / ⚪ never indexed) — click it to trigger `index_chat` for that thread directly from
@@ -169,6 +170,9 @@ mosquitto_pub -t "claude/browser/command" -m '{"action":"get_index_status","thre
 
 # Read the last 10 messages with their indexed state
 mosquitto_pub -t "claude/browser/command" -m '{"action":"read_chat","limit":10}'
+
+# Reply to a specific chat (navigates there first if needed)
+mosquitto_pub -t "claude/browser/command" -m '{"action":"send_chat_message","threadId":"955645746904856","text":"Hello from Claude Code"}'
 ```
 
 ### CLI Helper Script
