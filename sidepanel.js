@@ -116,12 +116,12 @@ async function sendChat(text) {
 
   // 1. Click input
   log('res', '⏳ Clicking input...');
-  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'click', selector: 'div[aria-label="Enter a prompt here"]', id: 'chat_click' } });
+  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'click', selector: 'rich-textarea .ql-editor, div[aria-label="Enter a prompt for Gemini"], .ql-editor[contenteditable="true"], div[aria-label="Enter a prompt here"]', id: 'chat_click' } });
   await new Promise(r => setTimeout(r, 300));
 
   // 2. Type message
   log('res', '⏳ Typing message...');
-  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'type', selector: 'div[aria-label="Enter a prompt here"]', text: text, id: 'chat_type' } });
+  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'type', selector: 'rich-textarea .ql-editor, div[aria-label="Enter a prompt for Gemini"], .ql-editor[contenteditable="true"], div[aria-label="Enter a prompt here"]', text: text, id: 'chat_type' } });
   await new Promise(r => setTimeout(r, 300));
 
   // 3. Press Enter
@@ -295,7 +295,7 @@ $('newChat').onclick = async () => {
         target: { tabId: tab.id },
         func: async () => {
           // Step 1: Deselect any active mode via Tools menu
-          const findTools = () => Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+          const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
           const toolsBtn = findTools();
           if (toolsBtn) {
             toolsBtn.click();

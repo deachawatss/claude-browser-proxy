@@ -17,7 +17,7 @@ function clickMenuItemByText(text) {
     setTimeout(() => {
       const menuItems = document.querySelectorAll('[role="menuitem"], [role="option"], button');
       for (const item of menuItems) {
-        if (item.textContent?.includes(text)) {
+        if (item.textContent?.toLowerCase().includes(text.toLowerCase())) {
           item.click();
           console.log('[Claude Proxy] Clicked menu item:', text);
           resolve(true);
@@ -246,9 +246,15 @@ function startAutoInject(actions = DEFAULT_ACTIONS) {
 function injectInputAreaButtons(tabId) {
   if (document.getElementById('claude-input-buttons')) return false;
 
-  // Find the "Tools" button
+  // Find the tools button to anchor the injected model/mode pill row after it.
+  // Current Gemini UI (2026-08) relabelled this to aria "Upload & tools"; old text "Tools" is DEAD
+  // (0 hits across all captures). Prefer the aria-label anchor; keep case-insensitive aria-contains
+  // and the old "Tools" text match as fallbacks (Nothing-is-Deleted).
   const allBtns = Array.from(document.querySelectorAll('button'));
-  const toolsBtn = allBtns.find(b => b.textContent?.trim() === 'Tools');
+  const toolsBtn = document.querySelector('button[aria-label="Upload & tools"]')
+    || document.querySelector('button[aria-label*="tools" i]')
+    || allBtns.find(b => b.getAttribute('aria-label')?.toLowerCase().includes('tool'))
+    || allBtns.find(b => b.textContent?.trim().toLowerCase() === 'tools');
   if (!toolsBtn) return false;
 
   const container = document.createElement('div');
