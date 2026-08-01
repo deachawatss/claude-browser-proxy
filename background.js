@@ -1573,6 +1573,36 @@ try {
   console.error('[Claude Browser Proxy] Failed to start:', e);
 }
 
+// --- MV3 service-worker keepalive ---------------------------------------
+// Chrome evicts an idle MV3 worker after ~30s, which silently drops the MQTT
+// socket so every command stops responding until the next Chrome event.
+// A recurring alarm wakes the worker before that and reconnects if the socket
+// is down (self-healing); when connected it touches the socket so Chrome sees
+// activity. This is what keeps select_model / select_mode / chat responsive
+// after the console has been idle.
+try {
+  chrome.alarms.create('mqtt-keepalive', { periodInMinutes: 0.4 }); // ~24s, under the eviction window
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== 'mqtt-keepalive') return;
+    if (!client || !isConnected) {
+      console.log('[MQTT] keepalive: reconnecting');
+      try { connect(); } catch (e) { console.error('[MQTT] keepalive reconnect failed', e); }
+    } else {
+      try {
+        client.publish(TOPICS.status, JSON.stringify({
+          status: 'online', timestamp: Date.now(), version: VERSION, keepalive: true
+        }), { retain: true });
+      } catch (e) { /* next alarm will reconnect */ }
+    }
+  });
+} catch (e) {
+  console.error('[Claude Browser Proxy] alarms keepalive unavailable:', e);
+}
+if (chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(() => { try { connect(); } catch (e) {} });
+}
+// ------------------------------------------------------------------------
+
 // Publish current page info (retained) - only for Gemini
 let lastPublishedUrl = '';
 async function publishCurrentPage() {
