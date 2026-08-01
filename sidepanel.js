@@ -174,11 +174,11 @@ async function sendChat(text) {
   const sent = await chrome.runtime.sendMessage({ action: 'command', command: { action: 'chat', text, tabId: target.id, id: 'chat_send' } });
   if (sent && sent.error) { log('res', '❌ ' + sent.error); return; }
 
-  // Wait for the reply, then auto-fetch it into the answer box
+  // Wait for the reply. The answer box is filled by the state-based auto-fetch
+  // (handleStateUpdate) once Gemini finishes generating — no explicit fetch here,
+  // which used to fire too early and log a misleading "No responses found".
   log('res', '⏳ Waiting for Gemini...');
   await chrome.runtime.sendMessage({ action: 'command', command: { action: 'wait_response', timeout: 30000, tabId: target.id, id: 'chat_wait' } });
-  await new Promise(r => setTimeout(r, 300));
-  $('b7')?.click(); // Get Gemini Response (reads the same target tab)
 }
 
 // Run input (chat, JS, or selector)
