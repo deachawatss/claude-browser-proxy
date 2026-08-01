@@ -86,10 +86,21 @@ async function checkStatus() {
   }
 }
 
+// Resolve the SAME Gemini tab that background.js handleCommand targets — the
+// most-recently-accessed gemini.google.com tab. The old {active:true,currentWindow:true}
+// query could return a DIFFERENT tab than the chat commands wrote to (especially with
+// several Gemini tabs open), so a chat submitted on tab X was read back on tab Y →
+// "No responses found". Returns an array (most-recent first) so `const [tab] = ...` works.
+async function getGeminiTabs() {
+  const tabs = await chrome.tabs.query({ url: 'https://gemini.google.com/*' });
+  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  return tabs;
+}
+
 // Page info
 async function updatePage() {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = await getGeminiTabs();
     if (tab) {
       $('pt').textContent = tab.title || 'Unknown';
       $('pu').textContent = tab.url || '';
@@ -169,14 +180,14 @@ async function publishResult(action, result) {
 
 // Buttons - direct execution + MQTT publish with debug
 $('b1').onclick = async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await getGeminiTabs();
   const result = { url: tab?.url || 'No URL', title: tab?.title || '' };
   log('res', '🔗 ' + result.url);
   const pub = await publishResult('get_url', result);
   if (pub?.ok) log('pub', pub);
 };
 $('b2').onclick = async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await getGeminiTabs();
   if (!tab) { log('res', '❌ No tab'); return; }
   const r = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText });
   const text = r[0]?.result || '';
@@ -185,7 +196,7 @@ $('b2').onclick = async () => {
   if (pub?.ok) log('pub', { ...pub, payload: { ...pub.payload, result: { text: text.substring(0, 200) + '...' } } });
 };
 $('b3').onclick = async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await getGeminiTabs();
   if (!tab) { log('res', '❌ No tab'); return; }
   const r = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => document.documentElement.outerHTML });
   const html = r[0]?.result || '';
@@ -208,7 +219,7 @@ $('b6').onclick = async () => {
 $('b7').onclick = async () => {
   log('cmd', '📥 Getting Gemini response...');
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = await getGeminiTabs();
     if (!tab || !tab.url?.includes('gemini.google.com')) {
       log('res', '❌ Not on Gemini page');
       return;
@@ -289,7 +300,7 @@ $('newChat').onclick = async () => {
   log('cmd', '✨ Resetting...');
   document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = await getGeminiTabs();
     if (tab) {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -458,7 +469,7 @@ syncLogs = syncLogsWithState;
 // Auto-load responses from DOM on startup
 async function autoLoadResponses() {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [tab] = await getGeminiTabs();
     if (!tab || !tab.url?.includes('gemini.google.com')) return;
 
     const result = await chrome.scripting.executeScript({
