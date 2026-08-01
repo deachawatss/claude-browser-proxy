@@ -75,6 +75,12 @@ function connect() {
       timestamp: Date.now(),
       version: VERSION
     }), { retain: true });
+
+    // Push current mode/model state (retained) so consoles start in sync
+    chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
+      const t = ts.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+      if (t) publishModeState(t.id);
+    }).catch(() => {});
   });
 
   client.on('message', (topic, message) => {
@@ -112,6 +118,33 @@ function publish(topic, message, retain = false) {
     client.publish(topic, payload, { retain });
     console.log('[MQTT] Published to', topic, retain ? '(retained)' : '');
   }
+}
+
+// Read the current Gemini model + active modes and publish them (RETAINED) so
+// consoles/dashboards can show mode state without polling. Retained means a late
+// subscriber gets the last value immediately, and it survives worker suspension.
+// Called on every model/mode change (see handleCommand tail) + keepalive + connect.
+async function publishModeState(tabId) {
+  if (!tabId) return;
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const b = document.querySelector('button[data-test-id="bard-mode-menu-button"], .input-area-switch');
+        let model = b ? (b.getAttribute('aria-label') || '') : '';
+        const i = model.toLowerCase().indexOf('currently');
+        model = (i >= 0 ? model.slice(i + 9) : model).replace(/\s+/g, ' ').trim();
+        const N = ['deep research', 'canvas', 'create image', 'create video', 'create music', 'guided learning'];
+        const modes = [...document.querySelectorAll('button')].filter(x =>
+          x.offsetParent !== null && x.querySelector('mat-icon') &&
+          N.indexOf((x.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()) >= 0
+        ).map(x => (x.textContent || '').replace(/\s+/g, ' ').trim());
+        return { model, modes };
+      }
+    });
+    const s = r && r[0] && r[0].result;
+    if (s) publish('claude/browser/mode_state', { ...s, timestamp: Date.now() }, true);
+  } catch (e) { /* tab isn't Gemini or scripting unavailable — ignore */ }
 }
 
 // Update extension badge and storage
@@ -1332,6 +1365,11 @@ Use double newlines between timestamps!`;
   };
   publish(TOPICS.response, response, true);
   await broadcastLog('res', response);
+  // After any model/mode change, push fresh retained mode state so consoles update
+  // even if the response itself is missed (worker was mid-reconnect).
+  if (command.action === 'select_model' || command.action === 'select_mode') {
+    publishModeState(tab && tab.id);
+  }
 }
 
 // Listen for messages from popup/sidepanel/content scripts
@@ -1592,6 +1630,11 @@ try {
         client.publish(TOPICS.status, JSON.stringify({
           status: 'online', timestamp: Date.now(), version: VERSION, keepalive: true
         }), { retain: true });
+        // refresh retained mode state while we're awake
+        chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
+          const t = ts.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+          if (t) publishModeState(t.id);
+        }).catch(() => {});
       } catch (e) { /* next alarm will reconnect */ }
     }
   });
