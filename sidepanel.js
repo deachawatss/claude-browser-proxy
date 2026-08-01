@@ -97,6 +97,30 @@ async function getGeminiTabs() {
   return tabs;
 }
 
+// Auto-activate toggle: restore saved state + persist changes (default ON)
+(async () => {
+  const el = $('autoActivate');
+  if (!el) return;
+  const d = await chrome.storage.local.get('autoActivate');
+  el.checked = d.autoActivate !== false;
+  el.addEventListener('change', () => chrome.storage.local.set({ autoActivate: el.checked }));
+})();
+
+// Bring the target Gemini tab to the foreground before operating on it, so
+// "most-recent" resolves to the tab the user means (and the worker stays awake).
+// Gated by the auto-activate toggle.
+async function activateGeminiTab() {
+  const el = $('autoActivate');
+  if (el && !el.checked) return;
+  const [tab] = await getGeminiTabs();
+  if (tab) {
+    try {
+      await chrome.tabs.update(tab.id, { active: true });
+      if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
+    } catch (e) { /* ignore */ }
+  }
+}
+
 // Page info
 async function updatePage() {
   try {
@@ -124,6 +148,10 @@ async function cmd(action, extra = {}) {
 // Send chat to Gemini (clean UI)
 async function sendChat(text) {
   log('cmd', '💬 You: ' + text);
+
+  // Bring the target Gemini tab forward so chat + response hit the same tab
+  await activateGeminiTab();
+  await new Promise(r => setTimeout(r, 150));
 
   // 1. Click input
   log('res', '⏳ Clicking input...');
@@ -218,6 +246,7 @@ $('b6').onclick = async () => {
 // Get Gemini Response button - directly from DOM
 $('b7').onclick = async () => {
   log('cmd', '📥 Getting Gemini response...');
+  await activateGeminiTab();
   try {
     const [tab] = await getGeminiTabs();
     if (!tab || !tab.url?.includes('gemini.google.com')) {
