@@ -855,17 +855,19 @@ Use double newlines between timestamps!`;
             const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
             const targetModel = modelMap[modelName.toLowerCase()] || modelName;
 
-            // UNKNOWN: current Gemini mode-menu item selectors were NOT captured (Angular needs a
-            // trusted click to open the menu; synthetic .click() won't populate it). These role/
-            // menuitem selectors are UNVERIFIED against the new UI — kept as best-effort fallbacks.
-            // Matching is case-insensitive because Gemini localizes/re-cases labels.
+            // Current Gemini model menu (verified live 2026-08): role="menuitem" items titled
+            // "3.5 Flash-Lite", "3.6 Flash", "3.1 Pro", "Extended thinking", each with a second
+            // description line. Match the TITLE (first line) not the whole textContent, else
+            // 'pro' would also hit "Complex problem solving" under Extended thinking. Case-
+            // insensitive because Gemini re-cases labels (e.g. "Extended thinking").
             const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="listbox"] button, .mat-mdc-menu-item');
             const wantLc = targetModel.toLowerCase();
-            for (const opt of options) {
-              if (opt.textContent.toLowerCase().includes(wantLc)) {
-                opt.click();
-                return { success: true, model: targetModel, debug, request: modelName };
-              }
+            const titleOf = (el) => ((el.textContent || '').trim().split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
+            let chosen = [...options].find(o => titleOf(o).toLowerCase().includes(wantLc));
+            if (!chosen) chosen = [...options].find(o => (o.textContent || '').toLowerCase().includes(wantLc));
+            if (chosen) {
+              chosen.click();
+              return { success: true, model: targetModel, debug, request: modelName };
             }
 
             const allClickables = document.querySelectorAll('button, div[role="option"], .mdc-list-item');
