@@ -106,19 +106,33 @@ async function getGeminiTabs() {
   el.addEventListener('change', () => chrome.storage.local.set({ autoActivate: el.checked }));
 })();
 
-// Bring the target Gemini tab to the foreground before operating on it, so
-// "most-recent" resolves to the tab the user means (and the worker stays awake).
-// Gated by the auto-activate toggle.
+// Resolve the Gemini tab the user actually means: the active tab in the focused
+// window first (what they're looking at), then most-recent Gemini as fallback.
+// This beats plain "most-recent" when many Gemini tabs are open.
+async function getTargetGeminiTab() {
+  let list = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (list[0] && (list[0].url || '').includes('gemini.google.com')) return list[0];
+  list = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (list[0] && (list[0].url || '').includes('gemini.google.com')) return list[0];
+  const gs = await getGeminiTabs();
+  return gs[0] || null;
+}
+
+// Resolve the target Gemini tab and (if the toggle is on) bring it to the front,
+// so chat + response hit the same visible tab and the worker stays awake.
+// Returns the target tab (so callers can pin its tabId), or null if none.
 async function activateGeminiTab() {
+  const target = await getTargetGeminiTab();
+  if (!target) return null;
   const el = $('autoActivate');
-  if (el && !el.checked) return;
-  const [tab] = await getGeminiTabs();
-  if (tab) {
+  if (!el || el.checked) {
     try {
-      await chrome.tabs.update(tab.id, { active: true });
-      if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
+      await chrome.tabs.update(target.id, { active: true });
+      if (target.windowId != null) await chrome.windows.update(target.windowId, { focused: true });
+      await new Promise(r => setTimeout(r, 200));
     } catch (e) { /* ignore */ }
   }
+  return target;
 }
 
 // Page info
@@ -149,28 +163,22 @@ async function cmd(action, extra = {}) {
 async function sendChat(text) {
   log('cmd', '💬 You: ' + text);
 
-  // Bring the target Gemini tab forward so chat + response hit the same tab
-  await activateGeminiTab();
-  await new Promise(r => setTimeout(r, 150));
+  // Resolve + focus the target Gemini tab, then PIN its tabId to every command
+  // so the whole exchange stays on one tab even with several Gemini tabs open.
+  const target = await activateGeminiTab();
+  if (!target) { log('res', '❌ No Gemini tab open'); return; }
 
-  // 1. Click input
-  log('res', '⏳ Clicking input...');
-  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'click', selector: 'rich-textarea .ql-editor, div[aria-label="Enter a prompt for Gemini"], .ql-editor[contenteditable="true"], div[aria-label="Enter a prompt here"]', id: 'chat_click' } });
-  await new Promise(r => setTimeout(r, 300));
+  // Use the all-in-one 'chat' action (types into the composer + clicks Send /
+  // Enter with a confirmation) — more reliable than separate click/type/key.
+  log('res', '⏳ Sending to Gemini...');
+  const sent = await chrome.runtime.sendMessage({ action: 'command', command: { action: 'chat', text, tabId: target.id, id: 'chat_send' } });
+  if (sent && sent.error) { log('res', '❌ ' + sent.error); return; }
 
-  // 2. Type message
-  log('res', '⏳ Typing message...');
-  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'type', selector: 'rich-textarea .ql-editor, div[aria-label="Enter a prompt for Gemini"], .ql-editor[contenteditable="true"], div[aria-label="Enter a prompt here"]', text: text, id: 'chat_type' } });
-  await new Promise(r => setTimeout(r, 300));
-
-  // 3. Press Enter
-  log('res', '⏳ Submitting...');
-  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'key', key: 'Enter', id: 'chat_enter' } });
-  await new Promise(r => setTimeout(r, 500));
-
-  // 4. Wait for response
+  // Wait for the reply, then auto-fetch it into the answer box
   log('res', '⏳ Waiting for Gemini...');
-  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'wait_response', timeout: 30000, id: 'chat_wait' } });
+  await chrome.runtime.sendMessage({ action: 'command', command: { action: 'wait_response', timeout: 30000, tabId: target.id, id: 'chat_wait' } });
+  await new Promise(r => setTimeout(r, 300));
+  $('b7')?.click(); // Get Gemini Response (reads the same target tab)
 }
 
 // Run input (chat, JS, or selector)
@@ -246,18 +254,20 @@ $('b6').onclick = async () => {
 // Get Gemini Response button - directly from DOM
 $('b7').onclick = async () => {
   log('cmd', '📥 Getting Gemini response...');
-  await activateGeminiTab();
   try {
-    const [tab] = await getGeminiTabs();
+    const tab = await activateGeminiTab();
     if (!tab || !tab.url?.includes('gemini.google.com')) {
       log('res', '❌ Not on Gemini page');
       return;
     }
-    // Get ALL responses from DOM
+    // Get the newest MODEL answer (skip the user's own turns).
     const result = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => {
-        const all = document.querySelectorAll('MESSAGE-CONTENT, message-content');
+        // model responses live in <message-content>; the user's query is a separate
+        // element. Prefer the last response inside a model-response container.
+        let all = document.querySelectorAll('model-response message-content, model-response MESSAGE-CONTENT');
+        if (all.length === 0) all = document.querySelectorAll('MESSAGE-CONTENT, message-content');
         if (all.length === 0) return { error: 'No responses found' };
         // Get all responses as array (full text)
         const responses = Array.from(all).map((el, i) => {
