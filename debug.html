@@ -51,6 +51,13 @@
     <code id="mqttTopics"></code>
   </div>
 
+  <div class="panel" style="margin-bottom: 20px; border: 1px solid #6d28d9;">
+    <h2>💬 Latest Gemini Answer <span id="answerTime" style="font-size:11px;color:#888;font-weight:normal;"></span></h2>
+    <div id="answerBox" style="white-space: pre-wrap; word-break: break-word; padding: 12px; background:#0f0f23; border-radius: 8px; min-height: 40px; color:#e5e7eb; line-height:1.5;">
+      <span style="color:#666;">No answer yet — send a chat, or click Get Response.</span>
+    </div>
+  </div>
+
   <div class="quick-info">
     <div class="info-card">
       <label>Version</label>
@@ -102,6 +109,7 @@
         <button class="btn-action" onclick="send({action:'get_url'})">Get URL</button>
         <button class="btn-action" onclick="send({action:'get_text'})">Get Text</button>
         <button class="btn-action" onclick="send({action:'get_state'})">Get State</button>
+        <button class="btn-action" onclick="send({action:'get_response'})">Get Response</button>
         <button class="btn-action" onclick="send({action:'get_html'})">Get HTML</button>
       </div>
 
@@ -138,7 +146,8 @@
       response: 'claude/browser/response',
       page: 'claude/browser/page',
       status: 'claude/browser/status',
-      state: 'claude/browser/state'
+      state: 'claude/browser/state',
+      answer: 'claude/browser/answer'
     };
 
     let client;
@@ -186,11 +195,19 @@
         document.getElementById('version').textContent = data.version || '-';
       } else if (topic === TOPICS.page) {
         document.getElementById('page').textContent = data.title || data.url || '-';
+      } else if (topic === TOPICS.answer) {
+        // Gemini's answer text (published by get_response / wait_response)
+        renderAnswer(data.answer, data.timestamp);
+        addLog('resLog', 'answer', topic, data);
       } else if (topic === TOPICS.response) {
         // Skip state polls for cleaner logs
         if (data.action === 'get_state' && data.id?.startsWith('state_poll')) {
           return;
         }
+
+        // Surface an answer that rode in on a command response (get_response/wait_response/chat)
+        const ans = data.answer || (data.result && data.result.answer);
+        if (ans) renderAnswer(ans, data.timestamp);
 
         // Handle list_tabs response - populate dropdown
         if (data.action === 'list_tabs' && data.tabs) {
@@ -211,11 +228,24 @@
         document.getElementById('responses').textContent = responseCount;
         addLog('resLog', 'res', topic, data);
       } else if (topic === TOPICS.state) {
-        // State updates
+        // State updates — dedupe identical consecutive polls to cut noise
         if (data.loading !== undefined) {
-          addLog('resLog', 'state', topic, data);
+          const sig = data.loading + '|' + data.responseCount + '|' + (data.tool || '');
+          if (sig !== lastStateSig) {
+            lastStateSig = sig;
+            addLog('resLog', 'state', topic, data);
+          }
         }
       }
+    }
+
+    let lastStateSig = null;
+    function renderAnswer(text, ts) {
+      if (!text) return;
+      const box = document.getElementById('answerBox');
+      box.textContent = text;
+      const t = ts ? new Date(ts) : new Date();
+      document.getElementById('answerTime').textContent = '— ' + t.toLocaleTimeString();
     }
 
     function addLog(logId, type, topic, data) {
@@ -274,17 +304,21 @@
       if (text) {
         send({ action: 'chat', text: text });
         document.getElementById('chatInput').value = '';
+        // Auto-fetch the reply: wait_response polls until Gemini finishes,
+        // then publishes to claude/browser/answer (which fills the answer box).
+        setTimeout(() => send({ action: 'wait_response', timeout: 30000 }), 1200);
       }
     }
 
     function canvasChat() {
       const text = document.getElementById('chatInput').value;
       if (!text) { alert('Type a message first'); return; }
-      // Select Canvas mode, wait for it, then send chat
+      // Select Canvas mode, wait for it, then send chat + auto-fetch reply
       send({ action: 'select_mode', mode: 'Canvas' });
       document.getElementById('chatInput').value = '';
       setTimeout(() => {
         send({ action: 'chat', text: text });
+        setTimeout(() => send({ action: 'wait_response', timeout: 30000 }), 1200);
       }, 4000);
     }
 
