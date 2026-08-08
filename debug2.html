@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gemini Proxy Debug Console (React)</title>
+  <!-- React as the lib; htm gives JSX-like templates with NO build step (senior-eng call for a self-contained debug page). -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/htm@3/dist/htm.umd.js" crossorigin></script>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, system-ui, sans-serif; background: #0a0a1a; color: #eee; margin: 0; padding: 20px; }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    h2 { font-size: 14px; margin: 0 0 8px; color: #a78bfa; }
+    .muted { color: #888; }
+    .status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+    .status.online { background: #065f46; color: #6ee7b7; }
+    .status.offline { background: #7f1d1d; color: #fca5a5; }
+    code { background: #1e1e3a; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+    .cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 14px 0; }
+    .card { background: #12122a; border: 1px solid #2a2a4a; border-radius: 10px; padding: 10px 14px; min-width: 120px; }
+    .card label { font-size: 10px; text-transform: uppercase; color: #888; letter-spacing: .05em; }
+    .card .val { font-size: 15px; font-weight: 600; margin-top: 2px; word-break: break-all; }
+    .answer { border: 1px solid #6d28d9; border-radius: 10px; padding: 14px; background: #12122a; margin-bottom: 18px; }
+    .answer .box { white-space: pre-wrap; word-break: break-word; background: #0a0a1a; border-radius: 8px; padding: 12px; min-height: 44px; line-height: 1.55; color: #e5e7eb; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel { background: #12122a; border: 1px solid #2a2a4a; border-radius: 10px; padding: 14px; }
+    .log { height: 300px; overflow-y: auto; font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+    .entry { border-bottom: 1px solid #1e1e3a; padding: 5px 0; }
+    .entry .time { color: #666; margin-right: 6px; }
+    .entry .topic { font-weight: 700; }
+    .entry.cmd .topic { color: #60a5fa; }
+    .entry.res .topic { color: #34d399; }
+    .entry.answer .topic { color: #c4b5fd; }
+    .entry.state .topic { color: #6b7280; }
+    .entry.status .topic { color: #fbbf24; }
+    .entry pre { margin: 3px 0 0; white-space: pre-wrap; word-break: break-word; color: #cbd5e1; }
+    .controls { margin-top: 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+    button { padding: 8px 14px; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; background: #4c1d95; color: #ede9fe; }
+    button:hover { filter: brightness(1.15); }
+    button.warn { background: #b45309; color: #fff; }
+    button.cyan { background: #0e7490; color: #fff; }
+    button.danger { background: #7f1d1d; color: #fecaca; }
+    input, textarea, select { padding: 8px; border-radius: 6px; background: #0a0a1a; color: #eee; border: 1px solid #2a2a4a; font-size: 13px; }
+    input, textarea { flex: 1; min-width: 120px; }
+    textarea { width: 100%; font-family: ui-monospace, monospace; min-height: 56px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const html = htm.bind(React.createElement);
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const MQTT_URL = 'ws://localhost:9001';
+    const TOPICS = {
+      command:  'claude/browser/command',
+      response: 'claude/browser/response',
+      page:     'claude/browser/page',
+      status:   'claude/browser/status',
+      state:    'claude/browser/state',
+      answer:   'claude/browser/answer',
+      modeState:'claude/browser/mode_state',
+    };
+    const shortTopic = (t) => t.split('/').pop();
+    const now = () => new Date().toLocaleTimeString();
+
+    // Runs in the Gemini page (via the execute action) and returns {model, modes}.
+    // model  = the picker's "currently X" label. modes = active mode CHIPS (a visible
+    // button with a mat-icon remove-X whose text is a mode name) — this is how we tell
+    // Deep Research / Canvas are ON, since select_mode is a toggle.
+    // Returns an OBJECT (not a JSON string): the execute response is built as
+    // { ...result, id, action }, so returning {model, modes} spreads them onto
+    // the response as data.model / data.modes (a string would be spread char-by-char).
+    const UI_STATE_CODE = "(function(){var b=document.querySelector('button[data-test-id=\"bard-mode-menu-button\"], .input-area-switch');var model=b?(b.getAttribute('aria-label')||''):'';var i=model.toLowerCase().indexOf('currently');model=(i>=0?model.slice(i+9):model).replace(/\\s+/g,' ').trim();var N=['deep research','canvas','create image','create video','create music','guided learning'];var modes=[].slice.call(document.querySelectorAll('button')).filter(function(x){return x.offsetParent!==null&&x.querySelector('mat-icon')&&N.indexOf((x.textContent||'').replace(/\\s+/g,' ').trim().toLowerCase())>=0;}).map(function(x){return (x.textContent||'').replace(/\\s+/g,' ').trim();});return{model:model,modes:modes};})()";
+
+    function App() {
+      const [connected, setConnected] = useState(false);
+      const [info, setInfo] = useState({ version: '-', page: '-', responses: 0 });
+      const [answer, setAnswer] = useState(null);
+      const [uiState, setUiState] = useState({ model: null, modes: [] });
+      const [tabs, setTabs] = useState([]);
+      const [targetTab, setTargetTab] = useState('');
+      const [cmdLog, setCmdLog] = useState([]);
+      const [resLog, setResLog] = useState([]);
+      const [chat, setChat] = useState('');
+      const [clickSel, setClickSel] = useState('');
+      const [clickTxt, setClickTxt] = useState('');
+      const [custom, setCustom] = useState('{"action": "get_url"}');
+
+      const clientRef = useRef(null);
+      const cmdId = useRef(0);
+      const lastStateSig = useRef(null);
+      const respCount = useRef(0);
+      const targetRef = useRef('');
+      useEffect(() => { targetRef.current = targetTab; }, [targetTab]);
+
+      const pushLog = useCallback((setter, type, topic, data) => {
+        setter(prev => [{ id: Date.now() + Math.random(), type, topic: shortTopic(topic), time: now(), data }, ...prev].slice(0, 60));
+      }, []);
+
+      const handle = useCallback((topic, data) => {
+        if (topic === TOPICS.modeState) {
+          setUiState({ model: data.model || null, modes: Array.isArray(data.modes) ? data.modes : [] });
+          return; // retained push — primary source for the mode/model highlight
+        }
+        if (topic === TOPICS.status) {
+          setInfo(i => ({ ...i, version: data.version || '-' }));
+          pushLog(setResLog, 'status', topic, data);
+        } else if (topic === TOPICS.page) {
+          setInfo(i => ({ ...i, page: data.title || data.url || '-' }));
+        } else if (topic === TOPICS.answer) {
+          if (data.answer) setAnswer({ text: data.answer, ts: data.timestamp || Date.now() });
+          pushLog(setResLog, 'answer', topic, data);
+        } else if (topic === TOPICS.response) {
+          if (data.id === '__uistate') {
+            setUiState({ model: data.model || null, modes: Array.isArray(data.modes) ? data.modes : [] });
+            return; // silent — drives the mode/model highlight, not the log
+          }
+          if (data.action === 'get_state' && (data.id || '').startsWith('state_poll')) return;
+          const ans = data.answer || (data.result && data.result.answer);
+          if (ans) setAnswer({ text: ans, ts: data.timestamp || Date.now() });
+          if (data.action === 'list_tabs' && data.tabs) setTabs(data.tabs);
+          if (data.result && data.result.url) setInfo(i => ({ ...i, page: data.result.title || data.result.url }));
+          respCount.current += 1;
+          setInfo(i => ({ ...i, responses: respCount.current }));
+          pushLog(setResLog, 'res', topic, data);
+        } else if (topic === TOPICS.state) {
+          if (data.loading !== undefined) {
+            const sig = data.loading + '|' + data.responseCount + '|' + (data.tool || '');
+            if (sig !== lastStateSig.current) { lastStateSig.current = sig; pushLog(setResLog, 'state', topic, data); }
+          }
+        }
+      }, [pushLog]);
+
+      useEffect(() => {
+        const client = mqtt.connect(MQTT_URL, { clientId: 'debug2-react-' + Date.now(), reconnectPeriod: 3000 });
+        clientRef.current = client;
+        client.on('connect', () => {
+          setConnected(true);
+          Object.values(TOPICS).forEach(t => client.subscribe(t));
+          setTimeout(() => sendRaw({ action: 'list_tabs', id: 'list_tabs_' + Date.now() }), 400);
+          setTimeout(() => sendRaw({ action: 'execute', code: UI_STATE_CODE, id: '__uistate' }, { silent: true }), 900);
+        });
+        client.on('close', () => setConnected(false));
+        client.on('message', (topic, msg) => { try { handle(topic, JSON.parse(msg.toString())); } catch (e) {} });
+        return () => client.end(true);
+      }, [handle]);
+
+      const sendRaw = useCallback((cmd, opts = {}) => {
+        const c = clientRef.current; if (!c) return;
+        cmd.id = cmd.id || 'dbg2_' + (++cmdId.current);
+        if (targetRef.current && !cmd.tabId) cmd.tabId = parseInt(targetRef.current);
+        if (!opts.silent) pushLog(setCmdLog, 'cmd', TOPICS.command, cmd);
+        c.publish(TOPICS.command, JSON.stringify(cmd));
+      }, [pushLog]);
+
+      // Poll the live model/mode state so the buttons reflect what's actually ON.
+      const syncUiState = useCallback(() => sendRaw({ action: 'execute', code: UI_STATE_CODE, id: '__uistate' }, { silent: true }), [sendRaw]);
+      useEffect(() => {
+        const iv = setInterval(() => { if (clientRef.current) syncUiState(); }, 4000);
+        return () => clearInterval(iv);
+      }, [syncUiState]);
+      // fire a mode/model command, then re-read state shortly after so highlight updates
+      const sendAndSync = useCallback((cmd) => { sendRaw(cmd); setTimeout(syncUiState, 1600); }, [sendRaw, syncUiState]);
+
+      const sendChat = () => {
+        if (!chat.trim()) return;
+        sendRaw({ action: 'chat', text: chat });
+        setChat('');
+        // auto-fetch the reply so the answer panel fills
+        setTimeout(() => sendRaw({ action: 'wait_response', timeout: 30000 }), 1200);
+      };
+      const sendCustom = () => { try { sendRaw(JSON.parse(custom)); } catch (e) { alert('Invalid JSON: ' + e.message); } };
+
+      const Log = ({ title, entries }) => html`
+        <div class="panel">
+          <h2>${title}</h2>
+          <div class="log">
+            ${entries.map(e => html`
+              <div class="entry ${e.type}" key=${e.id}>
+                <span class="time">${e.time}</span><span class="topic">[${e.topic}]</span>
+                <pre>${JSON.stringify(e.data, null, 2)}</pre>
+              </div>`)}
+          </div>
+        </div>`;
+
+      const _m = (uiState.model || '').toLowerCase();
+      const modelOn = { fast: /flash|fast/.test(_m), pro: /pro/.test(_m) && !/extended/.test(_m), thinking: /extended|thinking/.test(_m) };
+      const modeOn = { dr: (uiState.modes || []).some(x => /deep research/i.test(x)), canvas: (uiState.modes || []).some(x => /canvas/i.test(x)) };
+      const hi = (on) => on ? { outline: '2px solid #a78bfa', boxShadow: '0 0 0 3px rgba(167,139,250,.35)' } : {};
+
+      return html`
+        <h1>⚛️ Gemini Proxy Debug Console <span class="muted" style=${{fontSize:'13px'}}>React</span></h1>
+        <div>
+          <span class="status ${connected ? 'online' : 'offline'}">${connected ? 'Connected to MQTT' : 'Disconnected'}</span>
+          <code>${MQTT_URL}</code> <span class="muted">· ${Object.values(TOPICS).map(shortTopic).join(', ')}</span>
+        </div>
+        <div style=${{margin:'10px 0 -2px', fontSize:'13px'}}>
+          <span class="muted">Model:</span> <b>${uiState.model || '—'}</b>
+          <span class="muted"> · Active mode:</span> <b style=${{color: (modeOn.dr || modeOn.canvas) ? '#a78bfa' : '#777'}}>${(uiState.modes && uiState.modes.length) ? uiState.modes.join(', ') : 'none'}</b>
+          <span class="muted" style=${{marginLeft:'8px', fontSize:'11px'}}>(⬤ = ON · select_mode is a toggle)</span>
+        </div>
+
+        <div class="cards">
+          <div class="card"><label>Version</label><div class="val">${info.version}</div></div>
+          <div class="card"><label>Current Page</label><div class="val">${info.page}</div></div>
+          <div class="card"><label>Responses</label><div class="val">${info.responses}</div></div>
+          <div class="card" style=${{flex:2}}>
+            <label>Target Tab</label>
+            <div class="row" style=${{marginTop:'4px', marginBottom:0}}>
+              <select value=${targetTab} onChange=${e => setTargetTab(e.target.value)} style=${{flex:1}}>
+                <option value="">Auto (most recent)</option>
+                ${tabs.map(t => html`<option value=${t.id} key=${t.id}>${t.id} - ${t.title || 'Gemini'}${t.active ? ' ⭐' : ''}</option>`)}
+              </select>
+              <button onClick=${() => sendRaw({ action: 'list_tabs', id: 'list_tabs_' + Date.now() })}>🔄</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="answer">
+          <h2>💬 Latest Gemini Answer ${answer ? html`<span class="muted">— ${new Date(answer.ts).toLocaleTimeString()}</span>` : ''}</h2>
+          <div class="box">${answer ? answer.text : html`<span class="muted">No answer yet — send a chat, or click Get Response.</span>`}</div>
+        </div>
+
+        <div class="grid">
+          <${Log} title="📥 Commands Sent" entries=${cmdLog} />
+          <${Log} title="📤 Responses" entries=${resLog} />
+        </div>
+
+        <div class="controls panel">
+          <h2>🎮 Quick Actions</h2>
+          <div class="row">
+            <button style=${hi(modelOn.fast)} onClick=${() => sendAndSync({ action: 'select_model', model: 'fast' })}>⚡ Fast${modelOn.fast ? ' ⬤' : ''}</button>
+            <button style=${hi(modelOn.pro)} onClick=${() => sendAndSync({ action: 'select_model', model: 'pro' })}>🧠 Pro${modelOn.pro ? ' ⬤' : ''}</button>
+            <button style=${hi(modelOn.thinking)} onClick=${() => sendAndSync({ action: 'select_model', model: 'thinking' })}>💭 Think${modelOn.thinking ? ' ⬤' : ''}</button>
+            <button class="warn" style=${hi(modeOn.dr)} onClick=${() => sendAndSync({ action: 'select_mode', mode: 'Deep Research' })}>🔬 Deep Research${modeOn.dr ? ' ⬤' : ''}</button>
+            <button class="cyan" style=${hi(modeOn.canvas)} onClick=${() => sendAndSync({ action: 'select_mode', mode: 'Canvas' })}>🎨 Canvas${modeOn.canvas ? ' ⬤' : ''}</button>
+          </div>
+          <div class="row">
+            <button onClick=${() => sendRaw({ action: 'get_url' })}>Get URL</button>
+            <button onClick=${() => sendRaw({ action: 'get_text' })}>Get Text</button>
+            <button onClick=${() => sendRaw({ action: 'get_state' })}>Get State</button>
+            <button onClick=${() => sendRaw({ action: 'get_response' })}>Get Response</button>
+            <button onClick=${() => sendRaw({ action: 'get_html' })}>Get HTML</button>
+            <button class="danger" onClick=${() => { setCmdLog([]); setResLog([]); }}>Clear Logs</button>
+          </div>
+          <div class="row">
+            <input placeholder="Type message to send to Gemini..." value=${chat}
+              onChange=${e => setChat(e.target.value)} onKeyDown=${e => e.key === 'Enter' && sendChat()} />
+            <button onClick=${sendChat}>Send Chat</button>
+          </div>
+          <div class="row">
+            <input placeholder="CSS selector to click..." value=${clickSel} onChange=${e => setClickSel(e.target.value)} />
+            <button onClick=${() => clickSel && sendRaw({ action: 'click', selector: clickSel })}>Click</button>
+          </div>
+          <div class="row">
+            <input placeholder="Text to click..." value=${clickTxt} onChange=${e => setClickTxt(e.target.value)} />
+            <button onClick=${() => clickTxt && sendRaw({ action: 'clickText', text: clickTxt })}>Click Text</button>
+          </div>
+          <h2 style=${{marginTop:'14px'}}>📝 Custom Command (JSON)</h2>
+          <textarea value=${custom} onChange=${e => setCustom(e.target.value)}></textarea>
+          <div class="row" style=${{marginTop:'8px'}}><button onClick=${sendCustom}>Send Custom</button></div>
+        </div>
+      `;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+  </script>
+</body>
+</html>

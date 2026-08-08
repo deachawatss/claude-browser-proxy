@@ -8,6 +8,10 @@ Chrome extension ที่เชื่อมต่อ Claude Code CLI กับ 
 Claude Code CLI  <-->  MQTT Broker (Mosquitto)  <-->  Chrome Extension  <-->  Browser
 ```
 
+> **Status:** `v26.8.1.1839` — Gemini selectors verified against the current (2026-08) Gemini UI
+> (composer, send, model, mode/Deep Research), answers visible in the debug consoles, and an
+> MV3 keepalive so commands don't drop after idle. Selector reference: [`docs/GEMINI-SELECTORS.md`](docs/GEMINI-SELECTORS.md).
+
 ## What is this? | นี่คืออะไร?
 
 **Claude Browser Proxy** lets Claude Code (the CLI) control your browser through MQTT messages. This enables powerful automation workflows:
@@ -193,6 +197,20 @@ chmod +x claude-browser.sh
 ./claude-browser.sh get_response
 ```
 
+### Debug Consoles | หน้าจอ Debug
+
+Two self-contained web consoles connect directly to the broker over WebSocket
+(`ws://localhost:9001`) — no CLI needed. Open either as a `file://` in your browser:
+
+- **`debug.html`** — vanilla JS console: send any command, watch `command`/`response`/`state`
+  live, and see **Gemini's answer** rendered in a dedicated "Latest Gemini Answer" panel
+  (Send Chat auto-fetches the reply via `wait_response`).
+- **`debug2.html`** — the same console built with **React** (via `htm`, no build step).
+
+Both subscribe to `claude/browser/answer`, so the model's reply is always visible — not just
+the fact that a command was sent. Use the **Target Tab** dropdown to pin a specific Gemini
+tab when several are open.
+
 ## MQTT Topics | หัวข้อ MQTT
 
 | Topic | Direction | Purpose |
@@ -241,7 +259,7 @@ chmod +x claude-browser.sh
 |--------|-------------|------------|
 | `chat` | Send to Gemini | `text` |
 | `select_model` | Switch model | `model` (fast/thinking/pro) |
-| `select_mode` | Switch mode | `mode` (Deep Research) |
+| `select_mode` | Switch mode | `mode` (`Deep Research` / `Canvas`) |
 | `wait_response` | Wait for response | `timeout` (ms, default 15000) |
 | `transcribe` | Transcribe YouTube | `url`, `prompt` (optional) |
 
@@ -319,8 +337,9 @@ mosquitto_pub -t "claude/browser/command" -m '{"action":"chat","text":"Compare R
 The extension includes:
 
 - **Badge**: Shows version number, green when connected to MQTT + on Gemini
-- **Side Panel**: Debug view showing commands, responses, and connection status
-- **Injected UI**: Model switcher buttons and tab ID badges on Gemini pages
+- **Side Panel**: Debug view showing commands, responses, the latest Gemini answer, and connection status
+- **Injected UI**: Model/mode switcher pills (⚡ Fast · 💭 Thinking · 🧠 Pro · 🔬 Deep Research · 🎨 Canvas) and a `TAB:<id>` badge on Gemini pages
+- **Debug consoles**: `debug.html` and `debug2.html` (React) — standalone pages that talk to the broker directly and render Gemini's answers
 
 ## Troubleshooting | แก้ปัญหา
 
@@ -347,9 +366,20 @@ The command requires a Gemini tab. Either:
 
 ### Gemini selectors not working
 
-Gemini's UI may change. The extension uses multiple fallback selectors, but if issues persist:
+Gemini's UI changes over time. The extension keeps the current selector as primary and the
+older ones as fallbacks. The selectors are **verified against the 2026-08 Gemini UI** and
+documented — including how to re-capture them when the UI shifts again — in
+[`docs/GEMINI-SELECTORS.md`](docs/GEMINI-SELECTORS.md). If an action stops working:
 1. Check Chrome DevTools console on the Gemini page
-2. Report issues with the specific action that fails
+2. Compare the failing selector against `docs/GEMINI-SELECTORS.md`
+3. Report the specific action that fails
+
+### Commands stop responding after a while
+
+Chrome suspends idle MV3 service workers (~30s), which used to drop the MQTT socket so
+commands silently stopped. The extension now runs a `chrome.alarms` keepalive that wakes the
+worker and reconnects, so this should self-heal. If it persists, reload the extension and
+confirm the version badge — the keepalive shipped in `26.8.1.1839`.
 
 ## Architecture | สถาปัตยกรรม
 

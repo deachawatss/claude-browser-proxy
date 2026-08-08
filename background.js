@@ -75,6 +75,12 @@ function connect() {
       timestamp: Date.now(),
       version: VERSION
     }), { retain: true });
+
+    // Push current mode/model state (retained) so consoles start in sync
+    chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
+      const t = ts.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+      if (t) publishModeState(t.id);
+    }).catch(() => {});
   });
 
   client.on('message', (topic, message) => {
@@ -112,6 +118,33 @@ function publish(topic, message, retain = false) {
     client.publish(topic, payload, { retain });
     console.log('[MQTT] Published to', topic, retain ? '(retained)' : '');
   }
+}
+
+// Read the current Gemini model + active modes and publish them (RETAINED) so
+// consoles/dashboards can show mode state without polling. Retained means a late
+// subscriber gets the last value immediately, and it survives worker suspension.
+// Called on every model/mode change (see handleCommand tail) + keepalive + connect.
+async function publishModeState(tabId) {
+  if (!tabId) return;
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const b = document.querySelector('button[data-test-id="bard-mode-menu-button"], .input-area-switch');
+        let model = b ? (b.getAttribute('aria-label') || '') : '';
+        const i = model.toLowerCase().indexOf('currently');
+        model = (i >= 0 ? model.slice(i + 9) : model).replace(/\s+/g, ' ').trim();
+        const N = ['deep research', 'canvas', 'create image', 'create video', 'create music', 'guided learning'];
+        const modes = [...document.querySelectorAll('button')].filter(x =>
+          x.offsetParent !== null && x.querySelector('mat-icon') &&
+          N.indexOf((x.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()) >= 0
+        ).map(x => (x.textContent || '').replace(/\s+/g, ' ').trim());
+        return { model, modes };
+      }
+    });
+    const s = r && r[0] && r[0].result;
+    if (s) publish('claude/browser/mode_state', { ...s, timestamp: Date.now() }, true);
+  } catch (e) { /* tab isn't Gemini or scripting unavailable — ignore */ }
 }
 
 // Update extension badge and storage
@@ -204,7 +237,7 @@ Use double newlines between timestamps!`;
                 el.innerHTML = text.replace(/\n/g, '<br>');
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 setTimeout(() => {
-                  const sendBtn = document.querySelector('button[aria-label*="Send"], button.send-button, button[class*="send"]');
+                  const sendBtn = document.querySelector('button[aria-label="Send message"], button[aria-label*="Send"], button:has(mat-icon[fonticon="arrow_upward"]), button.send-button, button[class*="send"]');
                   if (sendBtn) sendBtn.click();
                 }, 500);
                 return { success: true };
@@ -572,7 +605,7 @@ Use double newlines between timestamps!`;
             return {
               loading: isLoading(),
               tool: getActiveTool(),
-              responseCount: document.querySelectorAll('MESSAGE-CONTENT').length,
+              responseCount: document.querySelectorAll('MESSAGE-CONTENT, message-content').length,
               timestamp: Date.now()
             };
           }
@@ -824,11 +857,18 @@ Use double newlines between timestamps!`;
             const debug = { totalButtons: allBtns.length, candidates: [] };
 
             let dropdownBtn = null;
-            dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
-            if (dropdownBtn) debug.foundBy = 'input-area-switch';
+            // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
+            dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
+            if (dropdownBtn) debug.foundBy = 'bard-mode-menu-button-testid';
+
+            // FALLBACK: legacy class (button.input-area-switch is the same element today, kept for A/B)
+            if (!dropdownBtn) {
+              dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
+              if (dropdownBtn) debug.foundBy = 'input-area-switch';
+            }
 
             if (!dropdownBtn) {
-              dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/));
+              dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
               if (dropdownBtn) debug.foundBy = 'text-match';
             }
 
@@ -848,12 +888,19 @@ Use double newlines between timestamps!`;
             const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
             const targetModel = modelMap[modelName.toLowerCase()] || modelName;
 
-            const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="listbox"] button, .mat-mdc-menu-item');
-            for (const opt of options) {
-              if (opt.textContent.includes(targetModel)) {
-                opt.click();
-                return { success: true, model: targetModel, debug, request: modelName };
-              }
+            // Current Gemini model menu (verified live 2026-08): role="menuitem" items titled
+            // "3.5 Flash-Lite", "3.6 Flash", "3.1 Pro", "Extended thinking", each with a second
+            // description line. Match the TITLE (first line) not the whole textContent, else
+            // 'pro' would also hit "Complex problem solving" under Extended thinking. Case-
+            // insensitive because Gemini re-cases labels (e.g. "Extended thinking").
+            const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="listbox"] button, .mat-mdc-menu-item');
+            const wantLc = targetModel.toLowerCase();
+            const titleOf = (el) => ((el.textContent || '').trim().split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
+            let chosen = [...options].find(o => titleOf(o).toLowerCase().includes(wantLc));
+            if (!chosen) chosen = [...options].find(o => (o.textContent || '').toLowerCase().includes(wantLc));
+            if (chosen) {
+              chosen.click();
+              return { success: true, model: targetModel, debug, request: modelName };
             }
 
             const allClickables = document.querySelectorAll('button, div[role="option"], .mdc-list-item');
@@ -878,7 +925,7 @@ Use double newlines between timestamps!`;
           target: { tabId: tab.id },
           func: async (modeName) => {
             const debug = {};
-            const findTools = () => Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+            const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
 
             // Step 1: Open Tools menu
             let toolsBtn = findTools();
@@ -897,7 +944,7 @@ Use double newlines between timestamps!`;
                 await new Promise(r => setTimeout(r, 1000));
 
                 // If toggling off the same mode, we're done
-                if (checkedName === modeName) {
+                if (checkedName?.toLowerCase() === modeName?.toLowerCase()) {
                   console.log('[Claude Proxy] Toggled off mode:', modeName);
                   return { success: true, mode: modeName, toggled: 'off', debug };
                 }
@@ -918,7 +965,7 @@ Use double newlines between timestamps!`;
             for (const item of items) {
               const text = item.textContent?.trim();
               const firstLine = text?.split('\n')[0]?.trim();
-              if (firstLine === modeName) {
+              if (firstLine?.toLowerCase() === modeName?.toLowerCase()) {
                 item.click();
                 debug.clicked = { tag: item.tagName, text: text.substring(0, 50) };
                 console.log('[Claude Proxy] Selected mode:', modeName);
@@ -977,6 +1024,7 @@ Use double newlines between timestamps!`;
                 'rich-textarea .ql-editor',
                 'rich-textarea [contenteditable="true"]',
                 '.ql-editor[contenteditable="true"]',
+                'div[aria-label="Enter a prompt for Gemini"]',
                 'div[aria-label="Enter a prompt here"]',
                 '[data-placeholder*="prompt"]',
                 '[contenteditable="true"]'
@@ -1008,7 +1056,7 @@ Use double newlines between timestamps!`;
               // Small delay then press Enter
               setTimeout(() => {
                 // Find and click send button as backup
-                const sendBtn = document.querySelector('button[aria-label*="Send"], button[data-test-id="send-button"], .send-button');
+                const sendBtn = document.querySelector('button[aria-label="Send message"], button[aria-label*="Send"], button:has(mat-icon[fonticon="arrow_upward"]), button[data-test-id="send-button"], .send-button');
                 if (sendBtn) {
                   sendBtn.click();
                 } else {
@@ -1317,6 +1365,11 @@ Use double newlines between timestamps!`;
   };
   publish(TOPICS.response, response, true);
   await broadcastLog('res', response);
+  // After any model/mode change, push fresh retained mode state so consoles update
+  // even if the response itself is missed (worker was mid-reconnect).
+  if (command.action === 'select_model' || command.action === 'select_mode') {
+    publishModeState(tab && tab.id);
+  }
 }
 
 // Listen for messages from popup/sidepanel/content scripts
@@ -1358,8 +1411,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       target: { tabId },
       func: async (modelName) => {
         const allBtns = Array.from(document.querySelectorAll('button'));
-        let dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
-        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/));
+        // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
+        let dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
+        // FALLBACK: legacy class / text / pill parent (kept for A/B; same element today)
+        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
+        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
         if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.parentElement?.className?.includes('pill-ui'));
         if (!dropdownBtn) return { error: 'Model dropdown not found' };
 
@@ -1409,7 +1465,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       target: { tabId },
       func: async (modeName) => {
         const debug = {};
-        const findTools = () => Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
+        const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
 
         // Step 1: Open Tools menu
         let toolsBtn = findTools();
@@ -1428,7 +1484,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             await new Promise(r => setTimeout(r, 1000));
 
             // If toggling off the same mode, we're done
-            if (checkedName === modeName) {
+            if (checkedName?.toLowerCase() === modeName?.toLowerCase()) {
               return { success: true, mode: modeName, toggled: 'off', debug };
             }
 
@@ -1449,7 +1505,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         for (const item of items) {
           const text = item.textContent?.trim();
           const firstLine = text?.split('\n')[0]?.trim();
-          if (firstLine === modeName) {
+          if (firstLine?.toLowerCase() === modeName?.toLowerCase()) {
             item.click();
             debug.clicked = { tag: item.tagName, text: text?.substring(0, 50) };
             return { success: true, mode: modeName, debug };
@@ -1554,6 +1610,41 @@ try {
 } catch (e) {
   console.error('[Claude Browser Proxy] Failed to start:', e);
 }
+
+// --- MV3 service-worker keepalive ---------------------------------------
+// Chrome evicts an idle MV3 worker after ~30s, which silently drops the MQTT
+// socket so every command stops responding until the next Chrome event.
+// A recurring alarm wakes the worker before that and reconnects if the socket
+// is down (self-healing); when connected it touches the socket so Chrome sees
+// activity. This is what keeps select_model / select_mode / chat responsive
+// after the console has been idle.
+try {
+  chrome.alarms.create('mqtt-keepalive', { periodInMinutes: 0.4 }); // ~24s, under the eviction window
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== 'mqtt-keepalive') return;
+    if (!client || !isConnected) {
+      console.log('[MQTT] keepalive: reconnecting');
+      try { connect(); } catch (e) { console.error('[MQTT] keepalive reconnect failed', e); }
+    } else {
+      try {
+        client.publish(TOPICS.status, JSON.stringify({
+          status: 'online', timestamp: Date.now(), version: VERSION, keepalive: true
+        }), { retain: true });
+        // refresh retained mode state while we're awake
+        chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
+          const t = ts.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+          if (t) publishModeState(t.id);
+        }).catch(() => {});
+      } catch (e) { /* next alarm will reconnect */ }
+    }
+  });
+} catch (e) {
+  console.error('[Claude Browser Proxy] alarms keepalive unavailable:', e);
+}
+if (chrome.runtime.onStartup) {
+  chrome.runtime.onStartup.addListener(() => { try { connect(); } catch (e) {} });
+}
+// ------------------------------------------------------------------------
 
 // Publish current page info (retained) - only for Gemini
 let lastPublishedUrl = '';
