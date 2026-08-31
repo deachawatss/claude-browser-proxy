@@ -41,7 +41,7 @@ fi
 
 # The harness writes the ready file only after the extension answers a command
 # published by someone else. Waiting on the file means waiting on evidence.
-for _ in $(seq 1 60); do
+for _ in $(seq 1 180); do
   sleep 1
   [[ -f "$READY" ]] && { echo "READY"; cat "$READY"; exit 0; }
   kill -0 "$(cat "$PIDFILE")" 2>/dev/null || { echo "harness exited early:"; cat "$LOG"; exit 1; }

@@ -14,7 +14,7 @@
 // virtual display (Xvfb) instead. Headed rendering is real; only the monitor is
 // missing. Screenshots are the way anyone looks at it.
 import { chromium } from 'playwright';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { probeBridge } from './bridge-probe.mjs';
@@ -29,9 +29,12 @@ const force = process.argv.includes('--force');
 
 // One bridge at a time. The extension's MQTT client id is a fixed string
 // (background.js: MQTT_CLIENT_ID), so two copies of it - one here, one in
-// Wind's own Chrome - claim the same identity. The broker evicts whichever
-// connected first, both reconnect every 5s, and commands land in whichever won
-// the last race. Refuse rather than produce that.
+// Wind's own Chrome - claim the same identity, and the broker evicts whichever
+// connected first. Measured with both live on 2026-08-31: status publishes went
+// from ~5/min to 29/min, the take-over fired the loser's last-will `offline`,
+// and the evicted side had not published again 60s later. Refuse rather than
+// produce that. This is a prediction, though, not a guarantee - see the tab
+// ownership check further down, which is the observation.
 const existing = await probeBridge({ timeoutMs: 6000 });
 if (existing && !force) {
   console.error('REFUSING TO START: a bridge is already answering commands.');
@@ -50,11 +53,13 @@ if (!existsSync(PROFILE)) mkdirSync(PROFILE, { recursive: true });
 const ctx = await chromium.launchPersistentContext(PROFILE, {
   headless: false,
   viewport: null,
-  // Google's sign-in refuses browsers that advertise automation. Dropping the
-  // switch puts navigator.webdriver back to false; the sign-in was verified
-  // by hand in this profile on 2026-08-31 and persists here.
-  ignoreDefaultArgs: ['--enable-automation'],
   args: [
+    // Google's sign-in refuses browsers that advertise automation, and this is
+    // the flag that hides it. Measured on 2026-08-31 across four launches:
+    // neither flag -> navigator.webdriver true; ignoreDefaultArgs
+    // ['--enable-automation'] alone -> still true (Playwright 1.62.1 never adds
+    // that switch, so dropping it does nothing); this flag alone -> false.
+    // The sign-in was then done by hand in this profile and persists here.
     '--disable-blink-features=AutomationControlled',
     `--remote-debugging-port=${CDP_PORT}`,
     `--disable-extensions-except=${EXTENSION}`,
@@ -77,11 +82,23 @@ const page = ctx.pages()[0] || (await ctx.newPage());
 await page.goto('https://gemini.google.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
 await page.waitForTimeout(4000);
 
-const text = (await page.evaluate(() => document.body?.innerText || '').catch(() => '')).slice(0, 300);
-const signedOut = /\bSign in\b/i.test(text);
-if (signedOut) {
+// Three states, not two. An evaluate that threw, or a page that has not painted
+// yet, is "unknown" - and an unknown that reports itself as "signed in" is the
+// same bug as a bridge that reports itself healthy while dropping commands.
+// The whole text is tested, not the first 300 characters: a "Sign in" further
+// down used to read as signed in.
+let signedOut = null;
+try {
+  const text = await page.evaluate(() => document.body?.innerText || '');
+  signedOut = text.trim() === '' ? null : /\bSign in\b/i.test(text);
+} catch {
+  signedOut = null;
+}
+if (signedOut === true) {
   console.warn('WARNING: this profile is signed out of Gemini.');
   console.warn('  See playwright/README.md for the one-off sign-in over noVNC.');
+} else if (signedOut === null) {
+  console.warn('WARNING: could not read the page, so the sign-in state is unknown.');
 }
 
 // content.js paints its own tab id into the page ("TAB:12345"). That is how
@@ -148,13 +165,34 @@ writeFileSync(READY_FILE, JSON.stringify({
 console.log(`READY - bridge answered from tab ${answer.tabId}, CDP on 127.0.0.1:${CDP_PORT}`);
 console.log(`state: ${READY_FILE}`);
 
+// The ready file is the state anyone else reads, so it must not outlive the
+// browser it describes. A crash an hour from now would otherwise leave a file
+// still naming a CDP endpoint and a successful bridge answer.
+const dropReadyFile = () => {
+  try {
+    unlinkSync(READY_FILE);
+  } catch { /* already gone */ }
+};
+
+let stopping = false;
 const shutdown = async () => {
+  stopping = true;
   console.log('\nshutting down');
+  dropReadyFile();
   await ctx.close().catch(() => {});
   process.exit(0);
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
 // Chrome exiting on its own (a crash, or someone closing the last window) must
-// take the harness with it, or down.sh would report success on a dead browser.
-ctx.on('close', () => process.exit(0));
+// take the harness with it, or up.sh would report a ready harness on a dead
+// browser. `stopping` keeps this from firing during an intentional shutdown,
+// where it would kill the process mid-teardown; and an unplanned death exits
+// non-zero, because that is a failure, not a completed run.
+ctx.on('close', () => {
+  if (stopping) return;
+  console.error('the browser closed unexpectedly');
+  dropReadyFile();
+  process.exit(1);
+});

@@ -7,16 +7,26 @@
 //
 //   node playwright/shot.mjs [--out FILE] [--full] [--url SUBSTRING]
 import { chromium } from 'playwright';
+import { parseArgs } from 'node:util';
+import { existsSync, statSync } from 'node:fs';
 
-const args = process.argv.slice(2);
-const flag = (name, fallback) => {
-  const i = args.indexOf(name);
-  return i === -1 ? fallback : args[i + 1];
-};
+// parseArgs, not a hand-rolled indexOf: `--out` as the LAST argument used to
+// yield `undefined`, which Playwright takes as "do not save the file". It then
+// printed a success line with the key silently dropped by JSON.stringify, and
+// exited 0. A screenshot tool that reports success without writing a file is
+// worse than one that crashes.
+const { values } = parseArgs({
+  options: {
+    out: { type: 'string', default: '/tmp/gemini-shot.png' },
+    url: { type: 'string', default: 'gemini.google.com' },
+    full: { type: 'boolean', default: false },
+  },
+  allowPositionals: false,
+});
 
-const OUT = flag('--out', '/tmp/gemini-shot.png');
-const MATCH = flag('--url', 'gemini.google.com');
-const FULL = args.includes('--full');
+const OUT = values.out;
+const MATCH = values.url;
+const FULL = values.full;
 const CDP = process.env.GEMINI_PW_CDP_PORT
   ? `http://127.0.0.1:${process.env.GEMINI_PW_CDP_PORT}`
   : 'http://127.0.0.1:9223';
@@ -36,7 +46,18 @@ if (!page) {
 }
 
 await page.screenshot({ path: OUT, fullPage: FULL });
-console.log(JSON.stringify({ out: OUT, url: page.url(), title: await page.title() }, null, 2));
+
+// Say it wrote a file only after seeing the file.
+if (!existsSync(OUT)) {
+  console.error(`FAILED: screenshot reported no error but ${OUT} does not exist.`);
+  process.exit(1);
+}
+console.log(JSON.stringify({
+  out: OUT,
+  bytes: statSync(OUT).size,
+  url: page.url(),
+  title: await page.title(),
+}, null, 2));
 
 // Deliberately no browser.close(): that would take the harness's browser with
 // it. Dropping the CDP socket by exiting is what leaves it running.
