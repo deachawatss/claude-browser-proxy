@@ -170,10 +170,29 @@ async function selectModeInPage(modeName) {
     return false;
   }
 
+  // The composer's "Deselect <mode>" set changes the moment a mode flips, and
+  // reading it does not require re-opening the menu. Capture it BEFORE the click
+  // so the wait below can key off an actual observable change.
+  const deselectSet = () => Array.from(document.querySelectorAll('button[aria-label]'))
+    .map(b => b.getAttribute('aria-label') || '')
+    .filter(l => /^deselect /i.test(l))
+    .sort().join('|');
+  const deselectBefore = deselectSet();
+
   const wasChecked = target.getAttribute('aria-checked') === 'true';
   target.click();
-  await sleep(800);
+  await sleep(400);
   debug.startedNewChat = await confirmNewChatIfAsked();
+
+  // Wait for the click to take effect, keyed to that change rather than to a
+  // fixed sleep. Measured 2026-08-31: the FIRST toggle after a conversation
+  // change lags, and a flat 800ms read saw the OLD value — so a working toggle
+  // was reported as failed, and the whole run shifted by one (Create image -> on
+  // read false, then Create image -> off read true).
+  let settle = 0;
+  while (settle < 8000 && deselectSet() === deselectBefore) { await sleep(250); settle += 250; }
+  debug.settleMs = settle;
+  debug.settled = deselectSet() !== deselectBefore;
 
   // Read the state back rather than assuming the click took. Selecting an item
   // CLOSES the menu, so re-open it and read the item's aria-checked. That is the
