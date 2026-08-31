@@ -61,7 +61,55 @@ nothing.
   were not capturable (Angular needs a trusted click). Kept as case-insensitive text match; verify before editing.
 - The `TAB:<id>` badge injects fine (confirms content.js runs).
 
+## The Tools menu, measured end to end (2026-08-31)
+
+Captured live over MQTT with **zero human clicks**, once the bridge could answer commands.
+
+| Item | Role | Where |
+|---|---|---|
+| Upload files | `menuitem` | top level |
+| Add from Drive | `menuitem` | top level |
+| Create image | `menuitemcheckbox` | top level |
+| Create video | `menuitemcheckbox` | top level |
+| Create music | `menuitemcheckbox` | top level |
+| Canvas | `menuitemcheckbox` | behind **More tools** |
+| Deep research | `menuitemcheckbox` | behind **More tools** |
+| Guided learning | `menuitemcheckbox` | behind **More tools** |
+
+Gemini spells it **`Deep research`**, lowercase r.
+
+### The menu's content is LAZILY LOADED
+The first open renders an empty shell — **2 descendant elements, zero items**. A later open of the
+same menu renders **88**. Anything that opens the menu, reads once and believes an empty result will
+report every mode as missing. Close and re-open; that is what fills it.
+
+### Submenu trigger
+`Canvas`, `Deep research` and `Guided learning` are behind a submenu whose trigger carries
+`data-test-id="more-tools-button"`. Expand it before concluding a mode is absent.
+
+### How to tell whether a mode is ON
+Selecting an item **closes** the menu, so its `aria-checked` cannot be re-read afterwards. The
+composer carries the authoritative signal instead: while a mode is on there is a
+`button[aria-label="Deselect <mode>"]`, and it disappears when the mode goes off. Verified both ways.
+
+### File upload needs no native dialog
+While the menu is open the page contains **3 real `input[type="file"]` elements**, and zero while it
+is shut. Build a `File`, put it in a `DataTransfer`, assign `input.files`, dispatch `change`.
+
+### The composer's emoji row is OURS, not Gemini's
+`⚡ 💭 🧠 🔬 🎨` are injected by this extension and mirror the side panel's Model/Mode buttons. They
+carry no `aria-label` and their text is a single emoji. Code that scans visible buttons for mode
+names finds these and nothing else — which is how the "Deep Research is gone" conclusion was reached.
+
 ## How to re-capture when the UI drifts again
-Use ego-browser against a logged-in Gemini tab. Synthetic `.click()` does NOT open Angular menus —
-use ego's `click([x,y])` (trusted event) or `snapshotText()` (captures the a11y overlay tree) to read
-menu items. Put text in the composer first to make the send button render.
+
+**Correction (2026-08-31):** this section used to say *"Synthetic `.click()` does NOT open Angular
+menus — use a trusted event"*. **That is wrong.** A purely synthetic `.click()` opens a fully
+populated Tools menu; measured repeatedly with no human involved. The behaviour that looked like a
+trusted-click requirement was the lazy first render described above. Acting on the old claim would
+have meant adding the `debugger` permission for nothing.
+
+Use the `describe` action (selector → label, role, `aria-checked`, visibility) against a logged-in
+Gemini tab. `execute` cannot help — the page CSP forbids `eval` — and `get_html` truncates at 50000
+characters, which on this page ends inside `<head>`. Put text in the composer first to make the send
+button render.
