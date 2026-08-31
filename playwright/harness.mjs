@@ -1,0 +1,151 @@
+// Keeps one real browser open, with this checkout's extension loaded into it.
+//
+// Why this exists (2026-08-31):
+//   1. The agent could not see the screen. Everything was read through the DOM
+//      over MQTT, so a stack of modals blocking every click was invisible.
+//      A browser Playwright owns can be screenshotted at any time - see shot.mjs.
+//   2. Chrome loaded the extension from a hand-made copy at
+//      C:\Users\deach\gemini-proxy, so every code change needed a manual reload
+//      click. This loads the extension straight from the git checkout, so a
+//      change ships by restarting the harness.
+//
+// The window is NOT visible on Wind's desktop: .wslconfig sets
+// guiApplications=false, so WSLg is off and there is no X server. up.sh runs a
+// virtual display (Xvfb) instead. Headed rendering is real; only the monitor is
+// missing. Screenshots are the way anyone looks at it.
+import { chromium } from 'playwright';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { probeBridge } from './bridge-probe.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const EXTENSION = resolve(HERE, '..');
+const PROFILE = process.env.GEMINI_PW_PROFILE
+  || `${process.env.HOME}/.cache/gemini-proxy-pw-profile`;
+const CDP_PORT = process.env.GEMINI_PW_CDP_PORT || '9223';
+const READY_FILE = '/tmp/gemini-pw-harness.ready';
+const force = process.argv.includes('--force');
+
+// One bridge at a time. The extension's MQTT client id is a fixed string
+// (background.js: MQTT_CLIENT_ID), so two copies of it - one here, one in
+// Wind's own Chrome - claim the same identity. The broker evicts whichever
+// connected first, both reconnect every 5s, and commands land in whichever won
+// the last race. Refuse rather than produce that.
+const existing = await probeBridge({ timeoutMs: 6000 });
+if (existing && !force) {
+  console.error('REFUSING TO START: a bridge is already answering commands.');
+  console.error(`  it replied: ${JSON.stringify(existing)}`);
+  console.error('  That is almost certainly the extension in your own Chrome.');
+  console.error('  Disable it there (chrome://extensions), or re-run with --force.');
+  process.exit(2);
+}
+if (existing && force) {
+  console.warn('WARNING: another bridge is live; --force given, starting anyway.');
+  console.warn('  Expect both to fight over the MQTT client id until one is stopped.');
+}
+
+if (!existsSync(PROFILE)) mkdirSync(PROFILE, { recursive: true });
+
+const ctx = await chromium.launchPersistentContext(PROFILE, {
+  headless: false,
+  viewport: null,
+  // Google's sign-in refuses browsers that advertise automation. Dropping the
+  // switch puts navigator.webdriver back to false; the sign-in was verified
+  // by hand in this profile on 2026-08-31 and persists here.
+  ignoreDefaultArgs: ['--enable-automation'],
+  args: [
+    '--disable-blink-features=AutomationControlled',
+    `--remote-debugging-port=${CDP_PORT}`,
+    `--disable-extensions-except=${EXTENSION}`,
+    `--load-extension=${EXTENSION}`,
+    '--start-maximized',
+  ],
+});
+
+// MV3 service worker. On a cold profile it registers a moment after launch.
+let sw = ctx.serviceWorkers()[0];
+if (!sw) sw = await ctx.waitForEvent('serviceworker', { timeout: 20000 }).catch(() => null);
+if (!sw) {
+  console.error('FAILED: the extension service worker never registered.');
+  await ctx.close();
+  process.exit(1);
+}
+console.log('extension service worker:', sw.url());
+
+const page = ctx.pages()[0] || (await ctx.newPage());
+await page.goto('https://gemini.google.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
+await page.waitForTimeout(4000);
+
+const text = (await page.evaluate(() => document.body?.innerText || '').catch(() => '')).slice(0, 300);
+const signedOut = /\bSign in\b/i.test(text);
+if (signedOut) {
+  console.warn('WARNING: this profile is signed out of Gemini.');
+  console.warn('  See playwright/README.md for the one-off sign-in over noVNC.');
+}
+
+// content.js paints its own tab id into the page ("TAB:12345"). That is how
+// this harness can tell whether the browser that answered the probe was THIS
+// one - a plain round trip cannot, because two bridges share one client id.
+const ownTabId = await (async () => {
+  for (let i = 0; i < 10; i++) {
+    const id = await page.evaluate(() => {
+      const el = document.querySelector('#claude-header-tab')
+        || document.querySelector('#claude-tab-inline');
+      const m = el?.textContent?.match(/TAB:\s*(\d+)/);
+      return m ? Number(m[1]) : null;
+    }).catch(() => null);
+    if (id) return id;
+    await page.waitForTimeout(1000);
+  }
+  return null;
+})();
+
+// Readiness is a round trip, not a flag: the extension has to answer a command
+// published by someone else before this harness calls itself up.
+const answer = await probeBridge({ timeoutMs: 20000 });
+if (!answer) {
+  console.error('FAILED: the extension loaded but the bridge did not answer a command.');
+  await ctx.close();
+  process.exit(1);
+}
+
+// With --force there is a second bridge on the same client id, so "something
+// answered" is not evidence that WE answered. Demand the stronger proof exactly
+// where the weaker one stops meaning anything.
+if (existing) {
+  if (ownTabId === null || answer.tabId !== ownTabId) {
+    console.error('FAILED: the answer did not come from this browser.');
+    console.error(`  our tab: ${ownTabId ?? 'unknown'}, answering tab: ${answer.tabId}`);
+    console.error('  The other bridge is still winning. Disable it and start without --force.');
+    await ctx.close();
+    process.exit(1);
+  }
+  console.log(`ownership verified: tab ${ownTabId} answered`);
+}
+
+writeFileSync(READY_FILE, JSON.stringify({
+  pid: process.pid,
+  cdp: `http://127.0.0.1:${CDP_PORT}`,
+  profile: PROFILE,
+  extension: EXTENSION,
+  serviceWorker: sw.url(),
+  signedOut,
+  tabId: ownTabId,
+  bridge: answer,
+  started: new Date().toISOString(),
+}, null, 2));
+
+console.log(`READY - bridge answered from tab ${answer.tabId}, CDP on 127.0.0.1:${CDP_PORT}`);
+console.log(`state: ${READY_FILE}`);
+
+const shutdown = async () => {
+  console.log('\nshutting down');
+  await ctx.close().catch(() => {});
+  process.exit(0);
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+// Chrome exiting on its own (a crash, or someone closing the last window) must
+// take the harness with it, or down.sh would report success on a dead browser.
+ctx.on('close', () => process.exit(0));
