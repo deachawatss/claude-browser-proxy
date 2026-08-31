@@ -141,19 +141,46 @@ async function selectModeInPage(modeName) {
   target.click();
   await sleep(800);
 
-  // Read the state back rather than assuming the click took.
+  // Read the state back rather than assuming the click took. Selecting an item
+  // CLOSES the menu, so the item we just clicked is usually gone from the DOM by
+  // now and aria-checked cannot be re-read. Gemini puts the authoritative signal
+  // in the composer instead: while a mode is on, a button labelled
+  // "Deselect <mode>" is present, and it disappears when the mode goes off.
+  // Measured both ways on 2026-08-31 for Deep research.
+  const deselectFor = () => Array.from(document.querySelectorAll('button[aria-label]'))
+    .find(b => /^deselect /i.test(b.getAttribute('aria-label') || '') &&
+               (b.getAttribute('aria-label') || '').toLowerCase().includes(wanted));
+
   const after = items().find(i => firstLine(i).toLowerCase() === wanted);
-  const nowChecked = after ? after.getAttribute('aria-checked') === 'true' : null;
+  let nowChecked = null;
+  let verifiedBy = null;
+  if (after) {
+    nowChecked = after.getAttribute('aria-checked') === 'true';
+    verifiedBy = 'aria-checked';
+  } else {
+    // Wait briefly: the composer control appears as the menu animates away.
+    let waited = 0;
+    while (waited < 2000 && !deselectFor() && wasChecked === false) { await sleep(250); waited += 250; }
+    nowChecked = !!deselectFor();
+    verifiedBy = 'composer-deselect-button';
+  }
   debug.wasChecked = wasChecked;
   debug.nowChecked = nowChecked;
+  debug.verifiedBy = verifiedBy;
 
   if (menuUp()) {
     document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   }
+
+  // Only claim success when the observed state actually changed. A dispatched
+  // click is not evidence.
+  const changed = nowChecked !== wasChecked;
   return {
-    success: nowChecked === null ? true : nowChecked !== wasChecked,
+    success: changed,
+    verified: true,
     mode: modeName,
-    toggled: nowChecked === null ? 'unknown' : (nowChecked ? 'on' : 'off'),
+    toggled: nowChecked ? 'on' : 'off',
+    ...(changed ? {} : { error: 'clicked ' + modeName + ' but its state did not change' }),
     debug
   };
 }
