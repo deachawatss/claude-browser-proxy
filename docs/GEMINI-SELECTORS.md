@@ -101,6 +101,50 @@ is shut. Build a `File`, put it in a `DataTransfer`, assign `input.files`, dispa
 carry no `aria-label` and their text is a single emoji. Code that scans visible buttons for mode
 names finds these and nothing else — which is how the "Deep Research is gone" conclusion was reached.
 
+### Modes are MUTUALLY EXCLUSIVE, and Gemini clears them on its own
+Turning one mode on turns any other off. Measured 2026-08-31: with Deep research on,
+selecting Create image left `Create image checked=true` and every other item `false`.
+
+Gemini also clears Deep research by itself once a research run completes. So a
+"turn it off" call issued afterwards will turn it back ON. Never assume a mode is
+still set because you set it — read `aria-checked` before toggling.
+
+### The composer chip RENAMES things
+- `Create image` on → `button[aria-label="Deselect Images"]`, not "Deselect Create image".
+- Only `Canvas` and `Deep research` keep their menu name in the composer.
+- An uploaded `leaf-upload-proof.txt` produced a chip labelled `close leaf-upload-proof`
+  — the extension was dropped. A longer name is truncated in the MIDDLE:
+  `close verify-fix...re-2053296`.
+
+Never verify by matching a name you chose against a label Gemini rendered. Read
+`aria-checked` from the menu item, or measure a NEW chip appearing.
+
+### "Done" signals differ per mode — and two obvious ones are WRONG
+
+| Mode | Reliable "finished" signal |
+|---|---|
+| Deep research | `button[aria-label="Stop response"]` disappears |
+| Create image | `Share image` / `Copy image` / `Download full size image` buttons appear, and `get_state` reports `loading:false` |
+
+Two signals that look right and are not, both burned on 2026-08-31:
+
+- **`Stop response` for image generation.** It vanishes *before* the image is finished, so
+  waiting on it declares success early.
+- **The text "Creating your image".** An image adds NO text to the page, so that caption sat
+  unchanged for 7 minutes after the image had actually rendered. A text-based check cannot
+  observe an image.
+
+### Deep research needs a second click
+Submitting a Deep research prompt only produces a PLAN. It then waits on a
+`GEM-BUTTON` whose text is exactly `Start research`. Use an exact text match:
+a partial match hits the enclosing `MAT-CARD`, whose text contains the phrase,
+and clicking the card does nothing.
+
+### Downloading a generated image
+`button[aria-label="Download full size image"]` works from a synthetic click. The file
+lands in the browser's download directory named as a UUID with a `.tmp` extension, and is
+a JPEG (2816x1536 in the observed case) — not a PNG, and not named after the prompt.
+
 ## How to re-capture when the UI drifts again
 
 **Correction (2026-08-31):** this section used to say *"Synthetic `.click()` does NOT open Angular
