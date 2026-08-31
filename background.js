@@ -14,9 +14,57 @@ const TOPICS = {
   state: 'claude/browser/state'  // Loading/tool state
 };
 
+// Stable across reconnects and across worker restarts, so the broker can resume
+// our session and hold the command subscription while the MV3 worker is suspended.
+const MQTT_CLIENT_ID = 'claude-browser-proxy';
+// How old a command may be and still run. Long enough to cover a worker nap and
+// the broker's redelivery, short enough that yesterday's queued command never
+// fires at you. Only applies to commands that carry a `ts`.
+const MAX_COMMAND_AGE_MS = 120000;
+
 let client = null;
 let isConnected = false;
 let connectedAt = 0; // Track connection time to ignore stale retained messages
+// Whether the broker has confirmed our subscription to the command topic.
+// Tracked separately from isConnected because the two failed apart on
+// 2026-08-31: the extension kept publishing keepalive "online" for hours while
+// nothing was subscribed, so every command was dropped and the status topic
+// still said the bridge was healthy. Publishing is not the same as listening.
+let isSubscribed = false;
+
+// Subscribe at QoS 1 so the broker queues commands published while we are asleep.
+// Re-callable: the keepalive alarm uses it to repair a lost subscription.
+function subscribeToCommands() {
+  if (!client) return;
+  client.subscribe(TOPICS.command, { qos: 1 }, (err, granted) => {
+    if (err) {
+      isSubscribed = false;
+      console.error('[MQTT] Subscribe error:', err);
+    } else {
+      // A granted qos of 128 means the broker refused the subscription.
+      const ok = Array.isArray(granted) && granted.length > 0 && granted[0].qos !== 128;
+      isSubscribed = ok;
+      console.log('[MQTT]', ok ? 'Subscribed to' : 'Subscription REFUSED for', TOPICS.command);
+    }
+    publishStatus();
+  });
+}
+
+// One place that builds the status payload, so `subscribed` can never be
+// omitted by a caller that only cares about liveness.
+function publishStatus(extra) {
+  if (!client) return;
+  try {
+    client.publish(TOPICS.status, JSON.stringify({
+      status: 'online',
+      subscribed: isSubscribed,   // false here means commands are being dropped
+      clientId: MQTT_CLIENT_ID,
+      timestamp: Date.now(),
+      version: VERSION,
+      ...(extra || {})
+    }), { retain: true });
+  } catch (e) { /* next alarm retries */ }
+}
 
 // Actions routed to a Messenger tab instead of a Gemini tab
 const MESSENGER_ACTIONS = new Set(['list_chats', 'index_chat', 'get_index_status', 'read_chat', 'send_chat_message']);
@@ -46,7 +94,16 @@ function connect() {
   console.log('[MQTT] Connecting to', MQTT_URL);
 
   client = mqtt.connect(MQTT_URL, {
-    clientId: 'claude-browser-' + Date.now(),
+    // A STABLE client id, deliberately. It used to be 'claude-browser-' + Date.now(),
+    // which gave the broker a brand-new identity on every reconnect, so it could never
+    // resume a session or hold a subscription on our behalf.
+    clientId: MQTT_CLIENT_ID,
+    // Persistent session. Chrome suspends an MV3 worker between alarms; with a clean
+    // session the broker forgets our subscription the moment the socket drops and every
+    // command sent in that window is lost with no trace. clean:false makes the broker
+    // keep the subscription and queue QoS>=1 commands until we wake.
+    // NOTE: the publisher must also send at QoS>=1 — QoS 0 messages are never queued.
+    clean: false,
     keepalive: 15, // 15 seconds - LWT triggers after ~22 sec if no ping
     reconnectPeriod: 5000, // Reconnect every 5 seconds
     will: {
@@ -62,19 +119,10 @@ function connect() {
     isConnected = true;
     connectedAt = Date.now(); // Track connection time
     updateBadge(true);
-
-    // Subscribe to command topic
-    client.subscribe(TOPICS.command, (err) => {
-      if (err) console.error('[MQTT] Subscribe error:', err);
-      else console.log('[MQTT] Subscribed to', TOPICS.command);
-    });
+    subscribeToCommands();
 
     // Publish "online" status (retained) - overrides LWT "offline"
-    client.publish(TOPICS.status, JSON.stringify({
-      status: 'online',
-      timestamp: Date.now(),
-      version: VERSION
-    }), { retain: true });
+    publishStatus();
 
     // Push current mode/model state (retained) so consoles start in sync
     chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
@@ -88,9 +136,17 @@ function connect() {
     try {
       const command = JSON.parse(message.toString());
 
-      // Ignore stale retained messages (older than our connection)
-      if (command.ts && command.ts < connectedAt) {
-        console.log('[MQTT] Ignoring stale message (ts:', command.ts, '< connected:', connectedAt, ')');
+      // Drop stale commands — but by AGE, not by connection time.
+      //
+      // This used to be `command.ts < connectedAt`, which is wrong now that the
+      // session is persistent: the broker deliberately holds commands while the
+      // MV3 worker is suspended and delivers them on reconnect, so every rescued
+      // command necessarily predates the new connection and would be thrown away
+      // by that test — silently undoing the queuing it was paired with.
+      // An age limit keeps the original intent (never replay an ancient retained
+      // command) while letting a command queued during a worker nap through.
+      if (command.ts && (Date.now() - command.ts) > MAX_COMMAND_AGE_MS) {
+        console.log('[MQTT] Ignoring stale command, age', Date.now() - command.ts, 'ms >', MAX_COMMAND_AGE_MS);
         return;
       }
 
@@ -103,6 +159,9 @@ function connect() {
   client.on('close', () => {
     console.log('[MQTT] Disconnected');
     isConnected = false;
+    // The subscription does not survive a dropped socket from our side either;
+    // clearing it here is what lets the keepalive notice and repair it.
+    isSubscribed = false;
     updateBadge(false);
   });
 
@@ -134,12 +193,21 @@ async function publishModeState(tabId) {
         let model = b ? (b.getAttribute('aria-label') || '') : '';
         const i = model.toLowerCase().indexOf('currently');
         model = (i >= 0 ? model.slice(i + 9) : model).replace(/\s+/g, ' ').trim();
+        // This reads the composer's quick-pill row, NOT the Tools menu — the menu
+        // is shut at this point and its items are not in the DOM. Two facts follow,
+        // and both were mistaken for evidence about the menu on 2026-08-30:
+        //   1. a mode that lives only inside the menu can never appear here;
+        //   2. the pills are A/B tested, so two accounts legitimately differ.
+        // The hardcoded name list below can also only ever return names we already
+        // expected, so it cannot discover a renamed or new mode. Use the
+        // `list_modes` action for a real answer; this stays as a cheap hint.
         const N = ['deep research', 'canvas', 'create image', 'create video', 'create music', 'guided learning'];
         const modes = [...document.querySelectorAll('button')].filter(x =>
           x.offsetParent !== null && x.querySelector('mat-icon') &&
           N.indexOf((x.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()) >= 0
         ).map(x => (x.textContent || '').replace(/\s+/g, ' ').trim());
-        return { model, modes };
+        // Label the provenance so an empty array cannot be read as "no modes exist".
+        return { model, modes, modesSource: 'composer-quick-pills', modesComplete: false };
       }
     });
     const s = r && r[0] && r[0].result;
@@ -918,6 +986,99 @@ Use double newlines between timestamps!`;
         result = result[0]?.result;
         break;
 
+      case 'list_modes':
+      case 'dump_menu': {
+        // Read-only reconnaissance of the Tools menu.
+        //
+        // Why this exists: the mode list in `mode_state` is built by filtering
+        // visible buttons against a HARDCODED list of six known names, with the
+        // menu shut. That reports the composer's quick-pill row, not the menu —
+        // which is why two accounts produced two different "mode lists" on
+        // 2026-08-30 and neither contained Deep research. Enumerating what you
+        // expect to find can only ever confirm what you already believed.
+        //
+        // This opens the real menu, expands anything collapsed, and reports what
+        // is actually in it, matching against nothing.
+        const wantDump = command.action === 'dump_menu';
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async (dump) => {
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+            const firstLine = el => ((el.textContent || '').trim().split('\n')[0] || '').trim();
+            const visible = el => el && el.offsetParent !== null;
+
+            // Same fallback chain the selector doc records. Never delete one.
+            const findTools = () =>
+              document.querySelector('button[aria-label="Upload & tools"]') ||
+              document.querySelector('button[aria-label*="tools" i]') ||
+              Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === 'Tools');
+
+            // Gemini has moved modes between roles before, so accept all of them.
+            const ITEM_SEL = '[role="menuitemcheckbox"],[role="menuitem"],[role="menuitemradio"],[role="option"]';
+            const collect = () => Array.from(document.querySelectorAll(ITEM_SEL))
+              .filter(visible)
+              .map(el => ({
+                label: firstLine(el),
+                role: el.getAttribute('role'),
+                checked: el.getAttribute('aria-checked'),
+                expanded: el.getAttribute('aria-expanded'),
+                haspopup: el.getAttribute('aria-haspopup'),
+                disabled: el.getAttribute('aria-disabled')
+              }))
+              .filter(m => m.label);
+
+            const btn = findTools();
+            if (!btn) return { ok: false, error: 'Tools button not found' };
+            btn.click();
+            await sleep(900);
+
+            const passes = [collect()];
+            const expanders = [];
+            for (let pass = 0; pass < 2; pass++) {
+              const collapsed = Array.from(document.querySelectorAll('[role="menu"] [aria-expanded="false"]'));
+              const more = Array.from(document.querySelectorAll(ITEM_SEL)).filter(el => /more/i.test(firstLine(el)));
+              const targets = collapsed.concat(more).filter(visible)
+                .filter(t => expanders.indexOf(firstLine(t) || t.getAttribute('aria-label') || '?') === -1);
+              if (!targets.length) break;
+              for (const t of targets) {
+                expanders.push(firstLine(t) || t.getAttribute('aria-label') || '?');
+                t.click();
+                await sleep(600);
+              }
+              passes.push(collect());
+            }
+
+            // Capture the raw menu BEFORE closing it — after Escape the nodes are gone.
+            const menuHtml = dump
+              ? Array.from(document.querySelectorAll('[role="menu"]')).map(m => m.outerHTML.substring(0, 6000))
+              : undefined;
+
+            const seen = new Map();
+            passes.forEach(list => list.forEach(m => {
+              if (!seen.has(m.label.toLowerCase())) seen.set(m.label.toLowerCase(), m);
+            }));
+            const items = Array.from(seen.values());
+
+            // Leave no UI state behind — this action is meant to be side-effect free.
+            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            await sleep(200);
+
+            const res = {
+              ok: true,
+              count: items.length,
+              modes: items.map(i => i.label),
+              expanders,
+              passCounts: passes.map(p => p.length)
+            };
+            if (dump) { res.items = items; res.menuHtml = menuHtml; }
+            return res;
+          },
+          args: [wantDump]
+        });
+        result = result[0]?.result;
+        break;
+      }
+
       case 'select_mode':
         // Select Gemini mode (Deep Research, Canvas, etc)
         // Uses menuitemcheckbox with aria-checked to detect active state
@@ -1627,9 +1788,14 @@ try {
       try { connect(); } catch (e) { console.error('[MQTT] keepalive reconnect failed', e); }
     } else {
       try {
-        client.publish(TOPICS.status, JSON.stringify({
-          status: 'online', timestamp: Date.now(), version: VERSION, keepalive: true
-        }), { retain: true });
+        // Connected but not subscribed is the exact state that made the bridge
+        // look healthy while silently dropping every command. Repair it here
+        // rather than waiting for a reconnect that may never come.
+        if (!isSubscribed) {
+          console.warn('[MQTT] keepalive: connected but NOT subscribed — resubscribing');
+          subscribeToCommands();
+        }
+        publishStatus({ keepalive: true });
         // refresh retained mode state while we're awake
         chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
           const t = ts.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
