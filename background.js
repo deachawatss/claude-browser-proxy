@@ -144,9 +144,36 @@ async function selectModeInPage(modeName) {
   const target = findItem();
   if (!target) return { error: modeName + ' not found in menu', debug };
 
+  // Selecting a tool while the current conversation already has content raises a
+  // confirmation: "Start a new chat? Selecting this tool will start a new chat."
+  // Until it is answered the mode does NOT change, so an unattended run fails
+  // silently. Measured 2026-08-31: in one run Create video, Canvas and Deep
+  // research failed while Create image, Create music and Guided learning passed —
+  // the only difference was whether the dialog happened to be raised. Three of
+  // them stacked up on screen unanswered.
+  //
+  // Confirming is the right answer: starting a new chat is exactly what a person
+  // clicking that tool would get. It is reported as startedNewChat so a caller is
+  // never surprised by a conversation switch it did not ask for.
+  async function confirmNewChatIfAsked() {
+    let waited = 0;
+    while (waited < 3000) {
+      const dlg = Array.from(document.querySelectorAll('[role="dialog"]'))
+        .find(d => /start a new chat/i.test(d.textContent || ''));
+      if (dlg) {
+        const go = Array.from(dlg.querySelectorAll('button'))
+          .find(b => /^new chat$/i.test((b.textContent || '').trim()));
+        if (go) { go.click(); await sleep(1500); return true; }
+      }
+      await sleep(250); waited += 250;
+    }
+    return false;
+  }
+
   const wasChecked = target.getAttribute('aria-checked') === 'true';
   target.click();
   await sleep(800);
+  debug.startedNewChat = await confirmNewChatIfAsked();
 
   // Read the state back rather than assuming the click took. Selecting an item
   // CLOSES the menu, so re-open it and read the item's aria-checked. That is the
@@ -192,6 +219,7 @@ async function selectModeInPage(modeName) {
     success: changed,
     verified: true,
     mode: modeName,
+    startedNewChat: !!debug.startedNewChat,
     toggled: nowChecked ? 'on' : 'off',
     ...(changed ? {} : { error: 'clicked ' + modeName + ' but its state did not change' }),
     debug
