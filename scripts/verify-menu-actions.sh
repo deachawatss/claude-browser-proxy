@@ -46,10 +46,16 @@ send() {
   local body
   body=$(printf '%s' "$payload" | sed "s/^{/{\"id\":\"$id\",\"ts\":$(date +%s)000,/")
   local out; out=$(mktemp)
+  # The payload goes through a FILE, not -m. An upload_file body carries base64
+  # bytes and can be megabytes; passed as an argument it dies with
+  # "Argument list too long" (verified: a 12MB arg fails, -f succeeds).
+  local bodyfile; bodyfile=$(mktemp)
+  printf '%s' "$body" > "$bodyfile"
   timeout $((timeout_s + 10)) mosquitto_sub -h "$HOST" -t "$RES_TOPIC" > "$out" 2>&1 &
   local subpid=$!
   sleep 1
-  mosquitto_pub -h "$HOST" -t "$CMD_TOPIC" -q 1 -m "$body"
+  mosquitto_pub -h "$HOST" -t "$CMD_TOPIC" -q 1 -f "$bodyfile"
+  rm -f "$bodyfile"
   local waited=0 line=""
   while [ $waited -lt "$timeout_s" ]; do
     line=$(grep -F "$id" "$out" 2>/dev/null | head -1)
@@ -118,6 +124,7 @@ if [ "$SKIP_UPLOAD" -eq 0 ]; then
   PLANNED=$((PLANNED + 1))
   BIG=$(head -c 9000000 /dev/zero | base64 -w0)
   OVER=$(send "{\"action\":\"upload_file\",\"filename\":\"too-big.bin\",\"mimeType\":\"application/octet-stream\",\"contentBase64\":\"$BIG\"}" 45)
+  unset BIG
   check "oversize file is rejected" "$OVER" 'over the'
 fi
 
