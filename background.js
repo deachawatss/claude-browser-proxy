@@ -24,7 +24,6 @@ const MAX_COMMAND_AGE_MS = 120000;
 
 let client = null;
 let isConnected = false;
-let connectedAt = 0; // Track connection time to ignore stale retained messages
 // Whether the broker has confirmed our subscription to the command topic.
 // Tracked separately from isConnected because the two failed apart on
 // 2026-08-31: the extension kept publishing keepalive "online" for hours while
@@ -117,7 +116,6 @@ function connect() {
   client.on('connect', () => {
     console.log('[MQTT] Connected!');
     isConnected = true;
-    connectedAt = Date.now(); // Track connection time
     updateBadge(true);
     subscribeToCommands();
 
@@ -1032,6 +1030,17 @@ Use double newlines between timestamps!`;
             btn.click();
             await sleep(900);
 
+            // Did the menu actually open? A synthetic click is untrusted, and Angular
+            // may ignore it. Without this check an ignored click yields count:0, which
+            // reads exactly like "the menu is empty" — the same confusion between a
+            // silent instrument and a real absence that this action exists to end.
+            const menuOpened = document.querySelectorAll('[role="menu"]').length > 0;
+            if (!menuOpened) {
+              return { ok: false, menuOpened: false,
+                       error: 'Tools button found but no [role=menu] appeared after the click — ' +
+                              'treat this as NO MEASUREMENT, not as an empty menu' };
+            }
+
             const passes = [collect()];
             const expanders = [];
             for (let pass = 0; pass < 2; pass++) {
@@ -1065,6 +1074,7 @@ Use double newlines between timestamps!`;
 
             const res = {
               ok: true,
+              menuOpened: true,
               count: items.length,
               modes: items.map(i => i.label),
               expanders,
