@@ -341,26 +341,18 @@ $('newChat').onclick = async () => {
   try {
     const [tab] = await getGeminiTabs();
     if (tab) {
+      // Step 1: clear the active mode through the ONE shared menu helper in
+      // background.js. This used to be a fourth private copy of the open-menu
+      // logic here, and it had already drifted — it clicked once, slept 800ms and
+      // read the menu, which is the lazy-render bug fixed everywhere else, so on a
+      // cold menu it cleared nothing and said nothing.
+      const cleared = await chrome.runtime.sendMessage({ action: 'deselect_active_mode' });
+
+      // Step 2: start the new chat. Navigation is the side panel's own concern,
+      // not menu logic, so it stays here.
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: async () => {
-          // Step 1: Deselect any active mode via Tools menu
-          const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
-          const toolsBtn = findTools();
-          if (toolsBtn) {
-            toolsBtn.click();
-            await new Promise(r => setTimeout(r, 800));
-            const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
-            for (const item of menuItems) {
-              if (item.getAttribute('aria-checked') === 'true') {
-                item.click();
-                await new Promise(r => setTimeout(r, 500));
-                break;
-              }
-            }
-          }
-
-          // Step 2: Click new chat button
           await new Promise(r => setTimeout(r, 300));
           const newBtn = document.querySelector('a[href="/app"]') ||
             Array.from(document.querySelectorAll('button')).find(b => b.getAttribute('aria-label')?.includes('New chat'));
@@ -369,7 +361,7 @@ $('newChat').onclick = async () => {
           return { success: true, method: 'navigate' };
         }
       });
-      log('res', '✨ Reset & new chat');
+      log('res', cleared?.cleared ? ('✨ Cleared ' + cleared.cleared + ' & new chat') : '✨ Reset & new chat');
     }
   } catch (e) {
     log('res', '❌ Error: ' + e.message);

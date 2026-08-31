@@ -65,96 +65,94 @@ function publishStatus(extra) {
   } catch (e) { /* next alarm retries */ }
 }
 
-// Injected into the Gemini page to turn a mode on or off. Defined once and used
-// by both the MQTT `select_mode` action and the side panel's message handler,
-// which were previously two near-copies of the same broken logic.
+// Ceiling on an uploaded file. The bytes travel as base64 in an MQTT payload on a
+// RETAINED topic, so an unbounded blob is a hazard to the broker as well as slow.
+// Exceeding it is a clear error, never a hang.
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+
+// THE ONE page-side helper for the Tools menu. Every menu-driven action goes
+// through it: listing, toggling a mode, attaching a file, and clearing whatever
+// mode is active.
 //
-// WHAT WAS BROKEN. It clicked the Tools button once, waited 800ms, then read
-// [role="menuitemcheckbox"]. Two things defeat that, both measured live on
-// 2026-08-31:
+// Why one function and not four helpers. These run inside the page via
+// chrome.scripting.executeScript, which serialises a SINGLE function and gives it
+// no access to module scope. So a shared helper cannot be imported — the only way
+// to share the open-menu logic is for the callers to share the function itself and
+// branch on an operation. Four near-copies existed before this (selectModeInPage,
+// uploadFileInPage, the list_modes case, and sidepanel.js's New Chat handler), and
+// they had already drifted: the sidepanel copy still clicked once, slept 800ms and
+// read, which is the exact lazy-render bug fixed everywhere else, so its "deselect
+// the active mode" step failed silently on a cold menu.
 //
-//   1. The menu's content is lazily loaded. The first open renders an EMPTY
-//      shell — 2 descendant elements and zero items — while a later open of the
-//      same menu renders 88. So the first attempt after a page load always found
-//      zero items and reported "not found in menu".
-//   2. Canvas, Deep research and Guided learning are NOT at the top level. They
-//      live behind a "More tools" submenu (data-test-id="more-tools-button").
-//      Nothing here ever expanded it, so those three were unreachable by name
-//      even when the menu did render.
-//
-// Note the spelling: Gemini writes "Deep research", lowercase r.
-async function selectModeInPage(modeName) {
+// op is one of: 'list' | 'select' | 'upload' | 'deselect-active'
+async function menuOpInPage(op, arg) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const debug = { attempts: [] };
+  const debug = { op, attempts: [] };
+  const firstLine = el => ((el.textContent || '').trim().split('\n')[0] || '').trim();
+  const visible = el => el && el.offsetParent !== null;
+
+  // Fallback chain recorded in docs/GEMINI-SELECTORS.md. Never delete one.
   const findTools = () =>
     document.querySelector('button[aria-label="Upload & tools"]') ||
     document.querySelector('button[aria-label*="tools" i]') ||
     Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === 'Tools');
+
   const menuUp = () => document.querySelectorAll('[role="menu"]').length > 0;
   const items = () => Array.from(document.querySelectorAll('[role="menuitemcheckbox"]'));
-  const firstLine = el => ((el.textContent || '').trim().split('\n')[0] || '').trim();
+  const inputs = () => Array.from(document.querySelectorAll('input[type="file"]'));
+  // Gemini has moved modes between roles before, so accept all of them.
+  const ITEM_SEL = '[role="menuitemcheckbox"],[role="menuitem"],[role="menuitemradio"],[role="option"]';
+  const anyItem = () => Array.from(document.querySelectorAll(ITEM_SEL)).filter(visible);
 
   const btn = findTools();
-  if (!btn) return { error: 'Tools button not found' };
+  if (!btn) return { ok: false, error: 'Tools button not found', debug };
 
-  const wanted = (modeName || '').trim().toLowerCase();
-  const findItem = () => items().find(i => firstLine(i).toLowerCase() === wanted);
-
-  // Open the menu and make sure it actually has items. An empty menu is the
-  // lazy-load case, and closing and re-opening is what fills it, so retry rather
-  // than reporting the mode missing. Used both before clicking and again
-  // afterwards to re-read the result.
-  async function openMenuWithItems() {
+  // Open the menu and make sure it actually HAS content. The menu's content is
+  // lazily loaded: the first open renders an empty shell — measured 2 descendant
+  // elements and zero items, where a later open renders 88. Closing and re-opening
+  // is what fills it, so retry rather than reporting the content missing.
+  // `hasContent` differs per op because upload waits on file inputs, not items.
+  async function openMenuWithContent(hasContent) {
+    const wasOpen = menuUp();
     for (let attempt = 1; attempt <= 3; attempt++) {
       if (!menuUp()) {
         btn.click();
         let waited = 0;
         while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
       }
-      // Give the lazily-loaded content a chance to appear.
       let waited = 0;
-      while (items().length === 0 && waited < 3000) { await sleep(250); waited += 250; }
-      debug.attempts.push({ attempt, menu: menuUp(), items: items().length });
-      if (items().length > 0) return true;
+      while (!hasContent() && waited < 3000) { await sleep(250); waited += 250; }
+      debug.attempts.push({ attempt, menu: menuUp(), content: hasContent() });
+      if (hasContent()) { debug.alreadyOpen = wasOpen; return true; }
       // Empty shell: close it, so the next pass re-opens a loaded menu.
       if (menuUp()) { btn.click(); await sleep(500); }
     }
+    debug.alreadyOpen = wasOpen;
     return false;
   }
 
-  // Canvas / Deep research / Guided learning sit behind "More tools".
-  async function expandMoreTools() {
+  // Canvas / Deep research / Guided learning sit behind this submenu.
+  async function expandMoreTools(found) {
     const more = document.querySelector('[data-test-id="more-tools-button"]') ||
-      items().concat(Array.from(document.querySelectorAll('button')))
-             .find(el => /^more tools$/i.test(firstLine(el)));
+      anyItem().concat(Array.from(document.querySelectorAll('button')))
+               .find(el => /^more tools$/i.test(firstLine(el)));
     if (!more) return false;
     debug.expandedMoreTools = true;
     more.click();
     let waited = 0;
-    while (!findItem() && waited < 3000) { await sleep(250); waited += 250; }
+    while (!found() && waited < 3000) { await sleep(250); waited += 250; }
     return true;
   }
 
-  if (!(await openMenuWithItems())) {
-    return { error: 'Tools menu opened but never rendered any items', debug };
+  function closeMenu() {
+    if (menuUp()) btn.click();
   }
-  if (!findItem()) await expandMoreTools();
 
-  debug.visible = items().map(firstLine);
-  const target = findItem();
-  if (!target) return { error: modeName + ' not found in menu', debug };
-
-  // Selecting a tool while the current conversation already has content raises a
-  // confirmation: "Start a new chat? Selecting this tool will start a new chat."
-  // Until it is answered the mode does NOT change, so an unattended run fails
-  // silently. Measured 2026-08-31: in one run Create video, Canvas and Deep
-  // research failed while Create image, Create music and Guided learning passed —
-  // the only difference was whether the dialog happened to be raised. Three of
-  // them stacked up on screen unanswered.
-  //
-  // Confirming is the right answer: starting a new chat is exactly what a person
-  // clicking that tool would get. It is reported as startedNewChat so a caller is
-  // never surprised by a conversation switch it did not ask for.
+  // Selecting a tool while the current conversation already has content raises
+  // "Start a new chat? Selecting this tool will start a new chat." Until it is
+  // answered the mode does NOT change, so an unattended run fails silently.
+  // Confirming is what a person clicking that tool would get; it is reported so a
+  // caller is never surprised by a conversation switch it did not ask for.
   async function confirmNewChatIfAsked() {
     let waited = 0;
     while (waited < 3000) {
@@ -171,186 +169,177 @@ async function selectModeInPage(modeName) {
   }
 
   // The composer's "Deselect <mode>" set changes the moment a mode flips, and
-  // reading it does not require re-opening the menu. Capture it BEFORE the click
-  // so the wait below can key off an actual observable change.
+  // reading it needs no menu. Note Gemini RENAMES modes here — "Create image"
+  // becomes "Deselect Images" — so only the SET is trustworthy, never the name.
   const deselectSet = () => Array.from(document.querySelectorAll('button[aria-label]'))
     .map(b => b.getAttribute('aria-label') || '')
     .filter(l => /^deselect /i.test(l))
     .sort().join('|');
-  const deselectBefore = deselectSet();
 
+  // ---- list / dump ------------------------------------------------------
+  if (op === 'list' || op === 'dump') {
+    if (!(await openMenuWithContent(() => anyItem().length > 0))) {
+      closeMenu();
+      return { ok: false, menuOpened: menuUp(), debug,
+               error: 'Tools menu never rendered any items — treat this as NO MEASUREMENT, not an empty menu' };
+    }
+    const collect = () => anyItem().map(el => ({
+      label: firstLine(el),
+      role: el.getAttribute('role'),
+      checked: el.getAttribute('aria-checked'),
+      haspopup: el.getAttribute('aria-haspopup'),
+      disabled: el.getAttribute('aria-disabled')
+    })).filter(m => m.label);
+
+    const passes = [collect()];
+    await expandMoreTools(() => false);
+    passes.push(collect());
+
+    const menuHtml = op === 'dump'
+      ? Array.from(document.querySelectorAll('[role="menu"]')).map(m => m.outerHTML.substring(0, 6000))
+      : undefined;
+
+    const seen = new Map();
+    passes.forEach(list => list.forEach(m => {
+      if (!seen.has(m.label.toLowerCase())) seen.set(m.label.toLowerCase(), m);
+    }));
+    const found = Array.from(seen.values());
+    closeMenu();
+    const res = { ok: true, menuOpened: true, count: found.length,
+                  modes: found.map(i => i.label), passCounts: passes.map(p => p.length), debug };
+    if (op === 'dump') { res.items = found; res.menuHtml = menuHtml; }
+    return res;
+  }
+
+  // ---- upload -----------------------------------------------------------
+  if (op === 'upload') {
+    const { filename, mimeType, b64 } = arg || {};
+    let bytes;
+    try {
+      const bin = atob(b64);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (e) {
+      return { success: false, attached: false, error: 'contentBase64 is not valid base64', debug };
+    }
+
+    if (!(await openMenuWithContent(() => inputs().length > 0))) {
+      closeMenu();
+      return { success: false, attached: false, error: 'Tools menu opened but contained no file input', debug };
+    }
+
+    const all = inputs();
+    const accepts = all.map(i => (i.getAttribute('accept') || '').toLowerCase());
+    const typeLc = (mimeType || '').toLowerCase();
+    const family = typeLc.split('/')[0];
+    let idx = accepts.findIndex(a => a && typeLc && (a.includes(typeLc) || a.includes(family + '/*')));
+    if (idx < 0) idx = accepts.findIndex(a => !a || a === '*/*');
+    if (idx < 0) idx = 0;
+    debug.accepts = accepts;
+    debug.chosenIndex = idx;
+
+    // An attachment chip carries a "close <name>" button. Record the set BEFORE,
+    // so a NEW one is the evidence. Do NOT match the file name: Gemini truncates
+    // it ("close verify-fix...re-2053296") and drops the extension.
+    const chipLabels = () => Array.from(document.querySelectorAll('button[aria-label]'))
+      .map(b => b.getAttribute('aria-label') || '')
+      .filter(l => /^close /i.test(l));
+    const before = new Set(chipLabels());
+
+    const file = new File([bytes], filename, { type: mimeType || 'application/octet-stream' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    all[idx].files = dt.files;
+    all[idx].dispatchEvent(new Event('change', { bubbles: true }));
+
+    await sleep(500);
+    closeMenu();
+
+    let waited = 0;
+    let addedChip = null;
+    while (waited < 20000 && !addedChip) {
+      addedChip = chipLabels().find(l => !before.has(l)) || null;
+      if (addedChip) break;
+      await sleep(500); waited += 500;
+    }
+    debug.waitedMs = waited;
+    debug.chipsBefore = before.size;
+    return {
+      success: !!addedChip, attached: !!addedChip, verified: true,
+      filename, chipLabel: addedChip, bytes: bytes.length,
+      ...(addedChip ? {} : {
+        error: 'the file was handed to the input but no new attachment chip appeared — treat this as NOT attached'
+      }),
+      debug
+    };
+  }
+
+  // ---- select / deselect-active ----------------------------------------
+  const wanted = op === 'select' ? String(arg || '').trim().toLowerCase() : null;
+  const findItem = () => wanted
+    ? items().find(i => firstLine(i).toLowerCase() === wanted)
+    : items().find(i => i.getAttribute('aria-checked') === 'true');
+
+  if (!(await openMenuWithContent(() => items().length > 0))) {
+    closeMenu();
+    return { success: false, verified: false, error: 'Tools menu opened but never rendered any items', debug };
+  }
+  if (!findItem()) await expandMoreTools(findItem);
+  debug.visible = items().map(firstLine);
+
+  const target = findItem();
+  if (!target) {
+    closeMenu();
+    if (op === 'deselect-active') return { success: true, verified: true, cleared: null, debug };
+    return { success: false, verified: true, error: arg + ' not found in menu', debug };
+  }
+
+  const clearedName = firstLine(target);
+  const deselectBefore = deselectSet();
   const wasChecked = target.getAttribute('aria-checked') === 'true';
   target.click();
   await sleep(400);
   debug.startedNewChat = await confirmNewChatIfAsked();
 
-  // Wait for the click to take effect, keyed to that change rather than to a
-  // fixed sleep. Measured 2026-08-31: the FIRST toggle after a conversation
-  // change lags, and a flat 800ms read saw the OLD value — so a working toggle
-  // was reported as failed, and the whole run shifted by one (Create image -> on
-  // read false, then Create image -> off read true).
+  // Wait for the click to take effect, keyed to an observable change rather than
+  // a fixed sleep. Measured: the FIRST toggle after a conversation change lags,
+  // and a flat 800ms read saw the OLD value, shifting a whole run by one.
   let settle = 0;
   while (settle < 8000 && deselectSet() === deselectBefore) { await sleep(250); settle += 250; }
   debug.settleMs = settle;
   debug.settled = deselectSet() !== deselectBefore;
 
-  // Read the state back rather than assuming the click took. Selecting an item
-  // CLOSES the menu, so re-open it and read the item's aria-checked. That is the
-  // authoritative, mode-independent signal.
-  //
-  // The composer chip is NOT usable for this. Gemini RENAMES modes there:
-  // "Create image" becomes a button labelled "Deselect Images". Matching the mode
-  // name against that label gave a false negative for four of the six modes on
-  // 2026-08-31 — the toggles worked, the check did not. Only Canvas and Deep
-  // research happen to keep their name.
-  async function readChecked() {
-    if (!(await openMenuWithItems())) return null;
-    let it = findItem();
-    if (!it) { await expandMoreTools(); it = findItem(); }
-    return it ? it.getAttribute('aria-checked') === 'true' : null;
+  if (op === 'deselect-active') {
+    closeMenu();
+    return { success: true, verified: true, cleared: clearedName, debug };
   }
 
-  const nowChecked = await readChecked();
+  // Re-open and re-read aria-checked. That is authoritative and identical for all
+  // six modes, unlike the composer chip whose label Gemini rewrites.
+  let nowChecked = null;
+  if (await openMenuWithContent(() => items().length > 0)) {
+    let it = findItem();
+    if (!it) { await expandMoreTools(findItem); it = findItem(); }
+    if (it) nowChecked = it.getAttribute('aria-checked') === 'true';
+  }
   debug.wasChecked = wasChecked;
   debug.nowChecked = nowChecked;
   debug.verifiedBy = nowChecked === null ? 'none' : 'aria-checked-reread';
+  closeMenu();
 
-  if (menuUp()) {
-    btn.click();
-    await sleep(300);
-  }
-
-  // Only claim success when the observed state actually changed, and never claim
-  // it at all when the state could not be read. A dispatched click is not
-  // evidence.
   if (nowChecked === null) {
-    return {
-      success: false,
-      verified: false,
-      mode: modeName,
-      toggled: 'unknown',
-      error: 'clicked ' + modeName + ' but could not re-read its state — treat as UNVERIFIED',
-      debug
-    };
+    return { success: false, verified: false, mode: arg, toggled: 'unknown',
+             startedNewChat: !!debug.startedNewChat,
+             error: 'clicked ' + arg + ' but could not re-read its state — treat as UNVERIFIED', debug };
   }
   const changed = nowChecked !== wasChecked;
   return {
     success: changed,
     verified: true,
-    mode: modeName,
+    mode: arg,
     startedNewChat: !!debug.startedNewChat,
     toggled: nowChecked ? 'on' : 'off',
-    ...(changed ? {} : { error: 'clicked ' + modeName + ' but its state did not change' }),
-    debug
-  };
-}
-
-// Ceiling on an uploaded file. The bytes travel as base64 in an MQTT payload on a
-// RETAINED topic, so an unbounded blob is a hazard to the broker as well as slow.
-// Exceeding it is a clear error, never a hang.
-const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
-
-// Injected into the Gemini page to attach a file to the composer.
-//
-// No native file dialog is involved and no new Chrome permission is needed. While
-// the Tools menu is open the page contains real input[type="file"] elements —
-// measured: 3 of them, and zero while the menu is shut. So this opens the menu,
-// builds a File from the bytes it was given, hands it to the input through a
-// DataTransfer, and fires `change`, which is what the app listens for.
-async function uploadFileInPage(filename, mimeType, b64) {
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const debug = { attempts: [] };
-  const findTools = () =>
-    document.querySelector('button[aria-label="Upload & tools"]') ||
-    document.querySelector('button[aria-label*="tools" i]') ||
-    Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === 'Tools');
-  const menuUp = () => document.querySelectorAll('[role="menu"]').length > 0;
-  const inputs = () => Array.from(document.querySelectorAll('input[type="file"]'));
-
-  let bytes;
-  try {
-    const bin = atob(b64);
-    bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  } catch (e) {
-    return { error: 'contentBase64 is not valid base64' };
-  }
-
-  const btn = findTools();
-  if (!btn) return { error: 'Tools button not found' };
-
-  // The file inputs live inside the menu, and the menu's content is lazily
-  // loaded — the first open renders an empty shell. Same retry as select_mode.
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    if (!menuUp()) {
-      btn.click();
-      let w = 0;
-      while (!menuUp() && w < 5000) { await sleep(250); w += 250; }
-    }
-    let w = 0;
-    while (inputs().length === 0 && w < 3000) { await sleep(250); w += 250; }
-    debug.attempts.push({ attempt, menu: menuUp(), inputs: inputs().length });
-    if (inputs().length > 0) break;
-    if (menuUp()) { btn.click(); await sleep(500); }
-  }
-
-  const all = inputs();
-  if (!all.length) return { error: 'Tools menu opened but contained no file input', debug };
-
-  // Several inputs exist; pick the one whose accept covers this type, else the
-  // most permissive, and record which was chosen so a wrong pick is visible.
-  const accepts = all.map(i => (i.getAttribute('accept') || '').toLowerCase());
-  const typeLc = (mimeType || '').toLowerCase();
-  const family = typeLc.split('/')[0];
-  let idx = accepts.findIndex(a => a && typeLc && (a.includes(typeLc) || a.includes(family + '/*')));
-  if (idx < 0) idx = accepts.findIndex(a => !a || a === '*/*');
-  if (idx < 0) idx = 0;
-  debug.accepts = accepts;
-  debug.chosenIndex = idx;
-
-  // An attachment chip carries a "close <name>" button. Record the set BEFORE, so
-  // a NEW one is the evidence — a differential measurement that does not depend
-  // on knowing how Gemini will render the name.
-  const chipLabels = () => Array.from(document.querySelectorAll('button[aria-label]'))
-    .map(b => b.getAttribute('aria-label') || '')
-    .filter(l => /^close /i.test(l));
-  const before = new Set(chipLabels());
-
-  const file = new File([bytes], filename, { type: mimeType || 'application/octet-stream' });
-  const dt = new DataTransfer();
-  dt.items.add(file);
-  all[idx].files = dt.files;
-  all[idx].dispatchEvent(new Event('change', { bubbles: true }));
-
-  await sleep(500);
-  if (menuUp()) { btn.click(); await sleep(300); }
-
-  // Confirm from the COMPOSER. Assigning `files` is not evidence the app took it.
-  //
-  // Do NOT match the file name: Gemini TRUNCATES it in the chip. A 25-character
-  // fixture came back as "close verify-fix...re-2053296" on 2026-08-31, so an
-  // exact-name check reported a successful upload as a failure.
-  let waited = 0;
-  let addedChip = null;
-  while (waited < 20000 && !addedChip) {
-    addedChip = chipLabels().find(l => !before.has(l)) || null;
-    if (addedChip) break;
-    await sleep(500); waited += 500;
-  }
-  debug.waitedMs = waited;
-  debug.chipsBefore = before.size;
-
-  return {
-    success: !!addedChip,
-    attached: !!addedChip,
-    verified: true,
-    filename,
-    chipLabel: addedChip,
-    bytes: bytes.length,
-    ...(addedChip ? {} : {
-      error: 'the file was handed to the input but no new attachment chip appeared — ' +
-             'treat this as NOT attached'
-    }),
+    ...(changed ? {} : { error: 'clicked ' + arg + ' but its state did not change' }),
     debug
   };
 }
@@ -1314,131 +1303,47 @@ Use double newlines between timestamps!`;
         result = result[0]?.result;
         break;
 
+      case 'reload_tab': {
+        // Exists so the lazy-render path can be TESTED. The Tools menu's content
+        // is lazily loaded and only the FIRST open after a page load renders the
+        // empty shell, so a suite run against an already-warm menu passes while
+        // that bug is present. Without a reload there is no way to reach the cold
+        // state from the CLI.
+        await chrome.tabs.reload(tab.id);
+        const deadline = Date.now() + 45000;
+        let loaded = false, composerReady = false;
+        while (Date.now() < deadline && !loaded) {
+          await new Promise(r => setTimeout(r, 500));
+          const t = await chrome.tabs.get(tab.id);
+          if (t.status === 'complete') loaded = true;
+        }
+        // "complete" is the document, not the app. Wait for the Tools button too,
+        // or the next command races a half-rendered SPA.
+        while (Date.now() < deadline && !composerReady) {
+          try {
+            const probe = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: () => !!(document.querySelector('button[aria-label="Upload & tools"]') ||
+                             document.querySelector('button[aria-label*="tools" i]'))
+            });
+            composerReady = !!probe[0]?.result;
+          } catch (e) { /* page still swapping documents */ }
+          if (!composerReady) await new Promise(r => setTimeout(r, 500));
+        }
+        result = {
+          success: loaded && composerReady,
+          loaded, composerReady,
+          ...(loaded && composerReady ? {} : { error: 'tab reloaded but the composer never appeared' })
+        };
+        break;
+      }
+
       case 'list_modes':
       case 'dump_menu': {
-        // Read-only reconnaissance of the Tools menu.
-        //
-        // Why this exists: the mode list in `mode_state` is built by filtering
-        // visible buttons against a HARDCODED list of six known names, with the
-        // menu shut. That reports the composer's quick-pill row, not the menu —
-        // which is why two accounts produced two different "mode lists" on
-        // 2026-08-30 and neither contained Deep research. Enumerating what you
-        // expect to find can only ever confirm what you already believed.
-        //
-        // This opens the real menu, expands anything collapsed, and reports what
-        // is actually in it, matching against nothing.
-        const wantDump = command.action === 'dump_menu';
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: async (dump) => {
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            const firstLine = el => ((el.textContent || '').trim().split('\n')[0] || '').trim();
-            const visible = el => el && el.offsetParent !== null;
-
-            // Same fallback chain the selector doc records. Never delete one.
-            const findTools = () =>
-              document.querySelector('button[aria-label="Upload & tools"]') ||
-              document.querySelector('button[aria-label*="tools" i]') ||
-              Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === 'Tools');
-
-            // Gemini has moved modes between roles before, so accept all of them.
-            const ITEM_SEL = '[role="menuitemcheckbox"],[role="menuitem"],[role="menuitemradio"],[role="option"]';
-            const collect = () => Array.from(document.querySelectorAll(ITEM_SEL))
-              .filter(visible)
-              .map(el => ({
-                label: firstLine(el),
-                role: el.getAttribute('role'),
-                checked: el.getAttribute('aria-checked'),
-                expanded: el.getAttribute('aria-expanded'),
-                haspopup: el.getAttribute('aria-haspopup'),
-                disabled: el.getAttribute('aria-disabled')
-              }))
-              .filter(m => m.label);
-
-            const btn = findTools();
-            if (!btn) return { ok: false, error: 'Tools button not found' };
-
-            // The menu is a toggle, so clicking while it is already open closes it.
-            // Only click when it is shut, otherwise this action turns the menu off
-            // and then reports that no menu appeared.
-            const menuUp = () => document.querySelectorAll('[role="menu"]').length > 0;
-            const wasOpen = menuUp();
-            if (!wasOpen) btn.click();
-
-            // Poll rather than sampling once. The single 900ms sample this replaces
-            // missed a menu that was measurably present at 2-3s on 2026-08-31.
-            let waited = 0;
-            while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
-
-            // The menu's content is lazily loaded: the first open renders an empty
-            // shell (2 descendants, zero items) while a later open renders 88.
-            // Close and re-open rather than reporting an empty menu as a finding.
-            const anyItems = () => document.querySelectorAll(ITEM_SEL).length > 0;
-            for (let retry = 0; retry < 2 && menuUp() && !anyItems(); retry++) {
-              btn.click(); await sleep(500);
-              btn.click();
-              let w = 0;
-              while (!anyItems() && w < 4000) { await sleep(250); w += 250; }
-              waited += w + 500;
-            }
-
-            // Did the menu actually open? A synthetic click is untrusted, and Angular
-            // may ignore it. Without this check an ignored click yields count:0, which
-            // reads exactly like "the menu is empty" — the same confusion between a
-            // silent instrument and a real absence that this action exists to end.
-            const menuOpened = menuUp();
-            if (!menuOpened) {
-              return { ok: false, menuOpened: false,
-                       error: 'Tools button found but no [role=menu] appeared after the click — ' +
-                              'treat this as NO MEASUREMENT, not as an empty menu' };
-            }
-
-            const passes = [collect()];
-            const expanders = [];
-            for (let pass = 0; pass < 2; pass++) {
-              const collapsed = Array.from(document.querySelectorAll('[role="menu"] [aria-expanded="false"]'));
-              const more = Array.from(document.querySelectorAll(ITEM_SEL)).filter(el => /more/i.test(firstLine(el)))
-                .concat(Array.from(document.querySelectorAll('[data-test-id="more-tools-button"]')));
-              const targets = collapsed.concat(more).filter(visible)
-                .filter(t => expanders.indexOf(firstLine(t) || t.getAttribute('aria-label') || '?') === -1);
-              if (!targets.length) break;
-              for (const t of targets) {
-                expanders.push(firstLine(t) || t.getAttribute('aria-label') || '?');
-                t.click();
-                await sleep(600);
-              }
-              passes.push(collect());
-            }
-
-            // Capture the raw menu BEFORE closing it — after Escape the nodes are gone.
-            const menuHtml = dump
-              ? Array.from(document.querySelectorAll('[role="menu"]')).map(m => m.outerHTML.substring(0, 6000))
-              : undefined;
-
-            const seen = new Map();
-            passes.forEach(list => list.forEach(m => {
-              if (!seen.has(m.label.toLowerCase())) seen.set(m.label.toLowerCase(), m);
-            }));
-            const items = Array.from(seen.values());
-
-            // Leave no UI state behind — this action is meant to be side-effect free.
-            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-            await sleep(200);
-
-            const res = {
-              ok: true,
-              menuOpened: true,
-              waitedMs: waited,
-              alreadyOpen: wasOpen,
-              count: items.length,
-              modes: items.map(i => i.label),
-              expanders,
-              passCounts: passes.map(p => p.length)
-            };
-            if (dump) { res.items = items; res.menuHtml = menuHtml; }
-            return res;
-          },
-          args: [wantDump]
+          func: menuOpInPage,
+          args: [command.action === 'dump_menu' ? 'dump' : 'list']
         });
         result = result[0]?.result;
         break;
@@ -1455,8 +1360,8 @@ Use double newlines between timestamps!`;
         }
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: uploadFileInPage,
-          args: [command.filename, command.mimeType || '', command.contentBase64]
+          func: menuOpInPage,
+          args: ['upload', { filename: command.filename, mimeType: command.mimeType || '', b64: command.contentBase64 }]
         });
         result = result[0]?.result;
         break;
@@ -1465,8 +1370,8 @@ Use double newlines between timestamps!`;
       case 'select_mode':
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: selectModeInPage,
-          args: [command.mode || 'Deep research']
+          func: menuOpInPage,
+          args: ['select', command.mode || 'Deep research']
         });
         result = result[0]?.result;
         break;
@@ -1917,6 +1822,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ error: e.message });
     });
     return true; // Keep channel open for async response
+  } else if (msg.action === 'deselect_active_mode') {
+    // The side panel's New Chat button used to carry its own copy of this: click
+    // Tools, sleep 800ms, walk [role=menuitemcheckbox]. That is the lazy-render
+    // bug fixed everywhere else, so on a cold menu it silently cleared nothing.
+    // It now goes through the one shared helper like every other menu action.
+    const tabId = sender.tab?.id;
+    const run = tabId
+      ? Promise.resolve(tabId)
+      : chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => ts[0]?.id);
+    run.then(id => {
+      if (!id) { sendResponse({ error: 'No Gemini tab' }); return; }
+      return chrome.scripting.executeScript({
+        target: { tabId: id },
+        func: menuOpInPage,
+        args: ['deselect-active', null]
+      }).then(r => sendResponse(r[0]?.result || { error: 'Script failed' }));
+    }).catch(e => sendResponse({ error: e.message }));
+    return true;
   } else if (msg.action === 'select_mode') {
     // Mode selection from content script (Deep Research, etc)
     const tabId = sender.tab?.id;
@@ -1926,8 +1849,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     chrome.scripting.executeScript({
       target: { tabId },
-      func: selectModeInPage,
-      args: [msg.mode || 'Deep research']
+      func: menuOpInPage,
+      args: ['select', msg.mode || 'Deep research']
     }).then(results => {
       sendResponse(results[0]?.result || { error: 'Script failed' });
     }).catch(e => {

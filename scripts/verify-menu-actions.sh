@@ -101,6 +101,26 @@ else
   PASSED=$((PASSED + 1)); echo "  PASS  calibration: absent mode correctly not matched"
 fi
 
+echo "== lazy render (cold menu) =="
+# The Tools menu's content is lazily loaded: the FIRST open after a page load
+# renders an empty shell. A run against an already-warm menu passes while that bug
+# is present, so this reaches the cold state deliberately rather than asking the
+# operator to remember.
+PLANNED=$((PLANNED + 2))
+RELOAD=$(send '{"action":"reload_tab"}' 60)
+check "tab reloads to a usable composer" "$RELOAD" '"success":true'
+COLD=$(send '{"action":"select_mode","mode":"Deep research"}' 90)
+check "first toggle on a COLD menu still works" "$COLD" '"toggled":"on"'
+sleep 1
+send '{"action":"select_mode","mode":"Deep research"}' 90 > /dev/null   # leave it off
+
+echo "== calibration: a mode that does not exist =="
+# Both polarities for the select path. Without this, "toggled":"on" for a real
+# mode and a checker that matches anything look identical.
+PLANNED=$((PLANNED + 1))
+BOGUS=$(send '{"action":"select_mode","mode":"Telepathy mode"}' 60)
+check "absent mode is reported not-found, not toggled" "$BOGUS" 'not found in menu'
+
 echo "== mode toggles =="
 for MODE in "Create image" "Create video" "Create music" "Canvas" "Deep research" "Guided learning"; do
   PLANNED=$((PLANNED + 2))
@@ -126,6 +146,22 @@ if [ "$SKIP_UPLOAD" -eq 0 ]; then
   OVER=$(send "{\"action\":\"upload_file\",\"filename\":\"too-big.bin\",\"mimeType\":\"application/octet-stream\",\"contentBase64\":\"$BIG\"}" 45)
   unset BIG
   check "oversize file is rejected" "$OVER" 'over the'
+
+
+  echo "== upload + mode coexist =="
+  # Story 15: "attach a file and set a mode in the same session without one
+  # undoing the other".
+  COEXIST_NAME="coexist-$$.txt"
+  COEXIST_B64=$(printf 'coexist fixture\n' | base64 -w0)
+  PLANNED=$((PLANNED + 3))
+  CO_UP=$(send "{\"action\":\"upload_file\",\"filename\":\"$COEXIST_NAME\",\"mimeType\":\"text/plain\",\"contentBase64\":\"$COEXIST_B64\"}" 60)
+  check "file attaches before setting a mode" "$CO_UP" '"attached":true'
+  CO_MODE=$(send '{"action":"select_mode","mode":"Canvas"}' 90)
+  check "mode turns on while a file is attached" "$CO_MODE" '"toggled":"on"'
+  CO_CHIP=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 45)
+  check "attachment survives the mode change" "$CO_CHIP" '"found":true'
+  send '{"action":"select_mode","mode":"Canvas"}' 90 > /dev/null            # mode off
+  send '{"action":"click","selector":"button[aria-label^=\"close\" i]"}' 45 > /dev/null  # chip off
 fi
 
 echo
