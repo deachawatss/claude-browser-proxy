@@ -11,14 +11,26 @@ LOG=/tmp/gemini-pw-harness.log
 PIDFILE=/tmp/gemini-pw-harness.pid
 READY=/tmp/gemini-pw-harness.ready
 
-# A running process is not a working one. An "already running" harness may still
-# be inside page.goto, inside the readiness probe, or one second away from
-# failing the ownership check - all of which satisfy `kill -0`. So this path
-# does NOT return early: it falls through to the same wait below, and exit 0
-# means "the bridge answered" no matter which path got us here.
-if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+# `kill -0` only asks whether SOME process owns that number. Pids get recycled,
+# so a dead harness plus an unrelated new process wearing its pid would pass -
+# and then the stale ready file left behind would be read as live state. Ask
+# instead whether the pid is OUR process.
+harness_alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" && -r "/proc/$pid/cmdline" ]] || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q 'harness\.mjs'
+}
+
+# A running process is not a working one either. An "already running" harness may
+# still be inside page.goto, inside the readiness probe, or one second away from
+# failing the ownership check. So this path does NOT return early: it falls
+# through to the same wait below, and exit 0 means "the bridge answered" no
+# matter which path got us here.
+if [[ -f "$PIDFILE" ]] && harness_alive "$(cat "$PIDFILE")"; then
   echo "already running (pid $(cat "$PIDFILE")) - waiting for it to report ready"
 else
+  # Nothing of ours is running, so anything left from a previous run is a lie.
+  rm -f "$PIDFILE"
   rm -f "$READY"
 
   # WSLg is off on this box (.wslconfig: guiApplications=false), so there is no X
@@ -44,7 +56,7 @@ fi
 for _ in $(seq 1 180); do
   sleep 1
   [[ -f "$READY" ]] && { echo "READY"; cat "$READY"; exit 0; }
-  kill -0 "$(cat "$PIDFILE")" 2>/dev/null || { echo "harness exited early:"; cat "$LOG"; exit 1; }
+  harness_alive "$(cat "$PIDFILE")" || { echo "harness exited early:"; cat "$LOG"; exit 1; }
 done
 
 echo "TIMED OUT waiting for the bridge to answer. Log:"

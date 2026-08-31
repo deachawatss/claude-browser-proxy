@@ -18,11 +18,22 @@ this git checkout**, and lets anyone screenshot it at any time.
 
 ## Quick start
 
+Once per clone — there is no `node_modules` and no browser binary until you do:
+
+```bash
+cd playwright && npm install && npx playwright install chromium
+```
+
+Then:
+
 ```bash
 playwright/up.sh          # start the display + browser, wait for the bridge to answer
 node playwright/shot.mjs  # look at it  -> /tmp/gemini-shot.png
 playwright/down.sh        # stop
 ```
+
+`package.json` pins both direct dependencies exactly. The lock file is not
+committed — the repo's `.gitignore` excludes it — so transitive versions float.
 
 `up.sh` prints `/tmp/gemini-pw-harness.ready`, which holds the CDP endpoint, the
 profile path and the bridge's first answer.
