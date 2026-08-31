@@ -38,6 +38,12 @@ committed — the repo's `.gitignore` excludes it — so transitive versions flo
 `up.sh` prints `/tmp/gemini-pw-harness-<port>.ready`, which holds the CDP endpoint, the
 profile path and the bridge's first answer.
 
+A second instance is possible — `GEMINI_PW_PROFILE` and `GEMINI_PW_CDP_PORT`
+give it its own profile, port and state files. **Pass the same
+`GEMINI_PW_CDP_PORT` to `down.sh`**, or it reads the default `9223` files,
+reports "harness was not running", and leaves your other harness up. The port is
+the key to all three state files, in all three scripts.
+
 ## One bridge at a time
 
 `background.js` uses a fixed MQTT client id (`MQTT_CLIENT_ID`). Two copies of

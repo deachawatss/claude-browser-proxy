@@ -106,6 +106,9 @@ if (signedOut === true) {
 }
 
 // Which tabs belong to THIS browser, asked of this browser's own extension.
+// Known and accepted: this is a snapshot taken before the probe below, so a
+// Gemini tab opened in the narrow window between the two would be absent from
+// the list and its answer would be refused. Refusing is the safe direction.
 // Not scraped from the page: content.js paints a TAB:<id> badge, but it only
 // appears after a getTabId round trip and a retry interval that gives up after
 // five attempts, so a slow injection or a covering modal would make the page a
