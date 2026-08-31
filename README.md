@@ -263,6 +263,7 @@ tab when several are open.
 | `list_modes` | Enumerate the Tools menu | - |
 | `dump_menu` | As `list_modes`, plus raw menu HTML | - |
 | `upload_file` | Attach a file to the composer | `filename`, `contentBase64`, `mimeType` (optional) |
+| `reload_tab` | Reload the Gemini tab and wait for the composer | - |
 | `wait_response` | Wait for response | `timeout` (ms, default 15000) |
 | `transcribe` | Transcribe YouTube | `url`, `prompt` (optional) |
 
