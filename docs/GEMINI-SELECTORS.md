@@ -34,6 +34,28 @@ This is the ground truth captured live (via ego-browser) plus the fallback strat
   **"Canvas"**, **"Deep research"** (lowercase r), "Create image", "Create video", "Create music", "Guided learning"
 - Active state: when Deep Research is on, a **"Try again without Deep Research"** control + a "Deep research" composer chip appear
 
+### ⚠ The mode list in `mode_state` is NOT the Tools menu (found 2026-08-31)
+
+`publishModeState()` runs with the menu **shut**, so the menu items are not in the DOM at all. It
+filters *visible buttons* against a hardcoded list of six known names, which means it reports the
+**composer quick-pill row** and can only ever return names we already expected.
+
+Two consequences, and both were mistaken for evidence about the menu:
+
+- A mode that lives only inside the menu can never appear in `mode_state.modes`.
+- The pill row is A/B tested, so two accounts legitimately return different lists.
+
+On 2026-08-30 this produced `["Create image","Create music","Canvas"]` on one account and
+`["Create image","Create video","Create music"]` on another, and the absence of "Deep research"
+from both was read as "the menu no longer offers Deep Research". **That conclusion is not supported
+by that measurement** — nobody had enumerated the open menu. The payload now carries
+`modesSource: "composer-quick-pills"` and `modesComplete: false` so it cannot be misread again.
+
+**To ask what the menu actually contains, use the `list_modes` action** (or `dump_menu` for the raw
+items plus menu HTML). Both open the menu, expand anything collapsed, accept
+`menuitemcheckbox`/`menuitem`/`menuitemradio`/`option`, close the menu again, and match against
+nothing.
+
 ## content.js injected UI — NEEDS LIVE VERIFICATION
 - Response 3-dot menu labels ("Export to Docs", "Listen", "Double-check") + `waitForDocsLink` "Open Docs"
   were not capturable (Angular needs a trusted click). Kept as case-insensitive text match; verify before editing.
