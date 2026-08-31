@@ -250,6 +250,13 @@ async function handleCommand(topic, command) {
   await broadcastLog('cmd', command);
 
   let result;
+  // Declared HERE, not inside the try, because the response object below reads
+  // `tab` AFTER the catch. With `let tab` inside the try it is out of scope at
+  // that point, so building the response threw ReferenceError and the publish on
+  // the next line never ran — every command did its work and then answered
+  // nothing. Proven 2026-08-31 by the extension logging each received command
+  // while no response was ever published.
+  let tab;
 
   try {
     // === TAB MANAGEMENT ACTIONS (don't require existing Gemini tab) ===
@@ -560,7 +567,6 @@ Use double newlines between timestamps!`;
     }
 
     // === RESOLVE TARGET TAB ===
-    let tab;
     if (command.tabId) {
       // Use specific tab if provided - simple and direct
       tab = await chrome.tabs.get(command.tabId);
