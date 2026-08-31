@@ -1151,34 +1151,6 @@ Use double newlines between timestamps!`;
         result = result[0]?.result;
         break;
 
-      case 'get_response':
-        // Get Gemini responses (same as sidebar button)
-        if (!tab.url?.includes('gemini.google.com')) {
-          result = { error: 'Not on Gemini page' };
-          break;
-        }
-        result = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: () => {
-            const all = document.querySelectorAll('MESSAGE-CONTENT, message-content');
-            if (all.length === 0) return { error: 'No responses found' };
-            // Get latest response (last one)
-            const latest = all[all.length - 1];
-            const answer = (latest.innerText || '').trim();
-            return {
-              answer: answer,
-              count: all.length,
-              timestamp: Date.now()
-            };
-          }
-        });
-        result = result[0]?.result;
-        // Also publish to answer topic for convenience
-        if (result && result.answer) {
-          publish(TOPICS.answer, result, true);
-        }
-        break;
-
       case 'chat':
         // SMOOTH: Fast chat - direct text insert + Enter
         if (!tab.url?.includes('gemini.google.com')) {
@@ -1846,13 +1818,23 @@ async function publishCurrentPage() {
 async function updateSidebarState() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const onGemini = tab?.url?.includes('gemini.google.com');
+    // There may be no active tab at all — between closing the last tab in a
+    // window, or while a window is losing focus. The line below used to read
+    // `tab?.url` and then `tab.id`, guarding the same object twice and then
+    // once not, so it threw exactly then. The empty catch swallowed it, which
+    // is why nothing ever reported a side panel that had quietly stopped
+    // updating.
+    if (!tab) return;
     await chrome.sidePanel.setOptions({
       tabId: tab.id,
       path: 'sidepanel.html',
-      enabled: onGemini
+      enabled: !!tab.url?.includes('gemini.google.com')
     });
-  } catch (e) {}
+  } catch (e) {
+    // Still non-fatal — a side panel that cannot be configured must not break
+    // tab switching — but no longer invisible.
+    console.warn('[Sidebar] setOptions failed:', e?.message || e);
+  }
 }
 
 // Listen for tab changes
