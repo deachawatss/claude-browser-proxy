@@ -110,19 +110,28 @@ if (!answer) {
   process.exit(1);
 }
 
-// With --force there is a second bridge on the same client id, so "something
-// answered" is not evidence that WE answered. Demand the stronger proof exactly
-// where the weaker one stops meaning anything.
-if (existing) {
-  if (ownTabId === null || answer.tabId !== ownTabId) {
-    console.error('FAILED: the answer did not come from this browser.');
-    console.error(`  our tab: ${ownTabId ?? 'unknown'}, answering tab: ${answer.tabId}`);
-    console.error('  The other bridge is still winning. Disable it and start without --force.');
-    await ctx.close();
-    process.exit(1);
-  }
-  console.log(`ownership verified: tab ${ownTabId} answered`);
+// "Something answered" is never evidence that WE answered, so this runs on
+// every start - not only when the startup probe happened to notice a rival.
+// That probe waits 6 seconds; the extension in Wind's Chrome runs on a ~24s
+// keepalive alarm (background.js: 'mqtt-keepalive'), so it can be asleep for
+// the whole probe, wake up afterwards, take the shared client id back, and
+// answer the readiness check itself. Gating the check on the prediction would
+// skip it in exactly that case.
+if (ownTabId === null) {
+  console.error('FAILED: cannot tell which browser answered.');
+  console.error('  content.js paints a TAB:<id> badge into the page and this one has none,');
+  console.error('  so ownership is unverifiable. Refusing rather than assuming it is ours.');
+  await ctx.close();
+  process.exit(1);
 }
+if (answer.tabId !== ownTabId) {
+  console.error('FAILED: the answer came from a different browser.');
+  console.error(`  our tab: ${ownTabId}, answering tab: ${answer.tabId}`);
+  console.error('  Another bridge holds the MQTT client id. Stop it, then start again.');
+  await ctx.close();
+  process.exit(1);
+}
+console.log(`ownership verified: tab ${ownTabId} answered`);
 
 writeFileSync(READY_FILE, JSON.stringify({
   pid: process.pid,

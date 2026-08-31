@@ -41,10 +41,15 @@ against two bridges can look fine and still be reading the wrong browser.
 
 `up.sh` therefore **refuses to start while another bridge answers commands**.
 Disable the extension in your own Chrome (`chrome://extensions`), or pass
-`--force` and accept the fight. Under `--force` the harness additionally
-requires that the answering `tabId` match its own — read from the `TAB:<id>`
-badge `content.js` paints into the page — because with two bridges sharing one
-identity, "something answered" is no longer evidence that *we* answered.
+`--force` and accept the fight.
+
+That refusal is a *prediction*, so it is never the last word. The startup probe
+listens for 6 seconds, while the extension in your Chrome runs on a ~24 second
+keepalive alarm — it can sleep through the whole probe, wake, take the shared
+client id back, and answer the readiness check itself. So the harness **always**
+requires the answering `tabId` to match its own, read from the `TAB:<id>` badge
+`content.js` paints into the page. If it cannot read that badge it refuses to
+start, rather than assume the answer was its own.
 
 ## No window on your desktop
 
