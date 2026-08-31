@@ -906,6 +906,40 @@ Use double newlines between timestamps!`;
         result = { downloadId: dlId };
         break;
 
+      case 'describe': {
+        // Selector -> what each matching element actually IS: its label, role and
+        // visibility. Reconnaissance only, no clicks, no state change.
+        //
+        // This exists because the two ways to ask that question are both dead on
+        // gemini.google.com: `execute` runs eval() and the page CSP forbids it
+        // ("'unsafe-eval' is not an allowed source of script"), and `get_html`
+        // truncates at 50000 characters, which on this page ends inside <head>
+        // before any composer markup. The composer's mode pills are icon-only, so
+        // their names live in aria-label and nowhere in innerText.
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: (sel, max) => {
+            const els = Array.from(document.querySelectorAll(sel));
+            return {
+              total: els.length,
+              elements: els.slice(0, max).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                label: el.getAttribute('aria-label'),
+                text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+                role: el.getAttribute('role'),
+                testId: el.getAttribute('data-test-id'),
+                checked: el.getAttribute('aria-checked'),
+                haspopup: el.getAttribute('aria-haspopup'),
+                visible: el.offsetParent !== null
+              }))
+            };
+          },
+          args: [command.selector, command.max || 40]
+        });
+        result = result[0]?.result;
+        break;
+      }
+
       case 'execute':
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
@@ -1033,14 +1067,24 @@ Use double newlines between timestamps!`;
 
             const btn = findTools();
             if (!btn) return { ok: false, error: 'Tools button not found' };
-            btn.click();
-            await sleep(900);
+
+            // The menu is a toggle, so clicking while it is already open closes it.
+            // Only click when it is shut, otherwise this action turns the menu off
+            // and then reports that no menu appeared.
+            const menuUp = () => document.querySelectorAll('[role="menu"]').length > 0;
+            const wasOpen = menuUp();
+            if (!wasOpen) btn.click();
+
+            // Poll rather than sampling once. The single 900ms sample this replaces
+            // missed a menu that was measurably present at 2-3s on 2026-08-31.
+            let waited = 0;
+            while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
 
             // Did the menu actually open? A synthetic click is untrusted, and Angular
             // may ignore it. Without this check an ignored click yields count:0, which
             // reads exactly like "the menu is empty" — the same confusion between a
             // silent instrument and a real absence that this action exists to end.
-            const menuOpened = document.querySelectorAll('[role="menu"]').length > 0;
+            const menuOpened = menuUp();
             if (!menuOpened) {
               return { ok: false, menuOpened: false,
                        error: 'Tools button found but no [role=menu] appeared after the click — ' +
@@ -1081,6 +1125,8 @@ Use double newlines between timestamps!`;
             const res = {
               ok: true,
               menuOpened: true,
+              waitedMs: waited,
+              alreadyOpen: wasOpen,
               count: items.length,
               modes: items.map(i => i.label),
               expanders,
