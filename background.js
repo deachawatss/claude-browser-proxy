@@ -65,6 +65,99 @@ function publishStatus(extra) {
   } catch (e) { /* next alarm retries */ }
 }
 
+// Injected into the Gemini page to turn a mode on or off. Defined once and used
+// by both the MQTT `select_mode` action and the side panel's message handler,
+// which were previously two near-copies of the same broken logic.
+//
+// WHAT WAS BROKEN. It clicked the Tools button once, waited 800ms, then read
+// [role="menuitemcheckbox"]. Two things defeat that, both measured live on
+// 2026-08-31:
+//
+//   1. The menu's content is lazily loaded. The first open renders an EMPTY
+//      shell — 2 descendant elements and zero items — while a later open of the
+//      same menu renders 88. So the first attempt after a page load always found
+//      zero items and reported "not found in menu".
+//   2. Canvas, Deep research and Guided learning are NOT at the top level. They
+//      live behind a "More tools" submenu (data-test-id="more-tools-button").
+//      Nothing here ever expanded it, so those three were unreachable by name
+//      even when the menu did render.
+//
+// Note the spelling: Gemini writes "Deep research", lowercase r.
+async function selectModeInPage(modeName) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const debug = { attempts: [] };
+  const findTools = () =>
+    document.querySelector('button[aria-label="Upload & tools"]') ||
+    document.querySelector('button[aria-label*="tools" i]') ||
+    Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === 'Tools');
+  const menuUp = () => document.querySelectorAll('[role="menu"]').length > 0;
+  const items = () => Array.from(document.querySelectorAll('[role="menuitemcheckbox"]'));
+  const firstLine = el => ((el.textContent || '').trim().split('\n')[0] || '').trim();
+
+  const btn = findTools();
+  if (!btn) return { error: 'Tools button not found' };
+
+  // Open the menu and make sure it actually has items. An empty menu is the
+  // lazy-load case, and closing and re-opening is what fills it, so retry rather
+  // than reporting the mode missing.
+  let opened = false;
+  for (let attempt = 1; attempt <= 3 && !opened; attempt++) {
+    if (!menuUp()) {
+      btn.click();
+      let waited = 0;
+      while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
+    }
+    // Give the lazily-loaded content a chance to appear.
+    let waited = 0;
+    while (items().length === 0 && waited < 3000) { await sleep(250); waited += 250; }
+    debug.attempts.push({ attempt, menu: menuUp(), items: items().length });
+    if (items().length > 0) { opened = true; break; }
+    // Empty shell: close it, so the next pass re-opens a loaded menu.
+    if (menuUp()) { btn.click(); await sleep(500); }
+  }
+  if (!opened) return { error: 'Tools menu opened but never rendered any items', debug };
+
+  const wanted = (modeName || '').trim().toLowerCase();
+  const find = () => items().find(i => firstLine(i).toLowerCase() === wanted);
+
+  // Canvas / Deep research / Guided learning sit behind "More tools".
+  if (!find()) {
+    const more = document.querySelector('[data-test-id="more-tools-button"]') ||
+      items().concat(Array.from(document.querySelectorAll('button')))
+             .find(el => /^more tools$/i.test(firstLine(el)));
+    if (more) {
+      debug.expandedMoreTools = true;
+      more.click();
+      let waited = 0;
+      while (!find() && waited < 3000) { await sleep(250); waited += 250; }
+    }
+  }
+
+  debug.visible = items().map(firstLine);
+  const target = find();
+  if (!target) return { error: modeName + ' not found in menu', debug };
+
+  const wasChecked = target.getAttribute('aria-checked') === 'true';
+  target.click();
+  await sleep(800);
+
+  // Read the state back rather than assuming the click took.
+  const after = items().find(i => firstLine(i).toLowerCase() === wanted);
+  const nowChecked = after ? after.getAttribute('aria-checked') === 'true' : null;
+  debug.wasChecked = wasChecked;
+  debug.nowChecked = nowChecked;
+
+  if (menuUp()) {
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  }
+  return {
+    success: nowChecked === null ? true : nowChecked !== wasChecked,
+    mode: modeName,
+    toggled: nowChecked === null ? 'unknown' : (nowChecked ? 'on' : 'off'),
+    debug
+  };
+}
+
 // Actions routed to a Messenger tab instead of a Gemini tab
 const MESSENGER_ACTIONS = new Set(['list_chats', 'index_chat', 'get_index_status', 'read_chat', 'send_chat_message']);
 
@@ -1080,6 +1173,18 @@ Use double newlines between timestamps!`;
             let waited = 0;
             while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
 
+            // The menu's content is lazily loaded: the first open renders an empty
+            // shell (2 descendants, zero items) while a later open renders 88.
+            // Close and re-open rather than reporting an empty menu as a finding.
+            const anyItems = () => document.querySelectorAll(ITEM_SEL).length > 0;
+            for (let retry = 0; retry < 2 && menuUp() && !anyItems(); retry++) {
+              btn.click(); await sleep(500);
+              btn.click();
+              let w = 0;
+              while (!anyItems() && w < 4000) { await sleep(250); w += 250; }
+              waited += w + 500;
+            }
+
             // Did the menu actually open? A synthetic click is untrusted, and Angular
             // may ignore it. Without this check an ignored click yields count:0, which
             // reads exactly like "the menu is empty" — the same confusion between a
@@ -1095,7 +1200,8 @@ Use double newlines between timestamps!`;
             const expanders = [];
             for (let pass = 0; pass < 2; pass++) {
               const collapsed = Array.from(document.querySelectorAll('[role="menu"] [aria-expanded="false"]'));
-              const more = Array.from(document.querySelectorAll(ITEM_SEL)).filter(el => /more/i.test(firstLine(el)));
+              const more = Array.from(document.querySelectorAll(ITEM_SEL)).filter(el => /more/i.test(firstLine(el)))
+                .concat(Array.from(document.querySelectorAll('[data-test-id="more-tools-button"]')));
               const targets = collapsed.concat(more).filter(visible)
                 .filter(t => expanders.indexOf(firstLine(t) || t.getAttribute('aria-label') || '?') === -1);
               if (!targets.length) break;
@@ -1142,63 +1248,10 @@ Use double newlines between timestamps!`;
       }
 
       case 'select_mode':
-        // Select Gemini mode (Deep Research, Canvas, etc)
-        // Uses menuitemcheckbox with aria-checked to detect active state
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: async (modeName) => {
-            const debug = {};
-            const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
-
-            // Step 1: Open Tools menu
-            let toolsBtn = findTools();
-            if (!toolsBtn) return { error: 'Tools button not found' };
-
-            toolsBtn.click();
-            await new Promise(r => setTimeout(r, 800));
-
-            // Step 2: Check if target is already active (toggle off) or deselect other mode
-            const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
-            for (const item of menuItems) {
-              if (item.getAttribute('aria-checked') === 'true') {
-                const checkedName = item.textContent?.trim().split('\n')[0]?.trim();
-                debug.deselected = checkedName;
-                item.click();
-                await new Promise(r => setTimeout(r, 1000));
-
-                // If toggling off the same mode, we're done
-                if (checkedName?.toLowerCase() === modeName?.toLowerCase()) {
-                  console.log('[Claude Proxy] Toggled off mode:', modeName);
-                  return { success: true, mode: modeName, toggled: 'off', debug };
-                }
-
-                // Otherwise, re-open Tools to select the new mode
-                await new Promise(r => setTimeout(r, 500));
-                toolsBtn = findTools();
-                if (!toolsBtn) return { error: 'Tools button not found after deselect', debug };
-                toolsBtn.click();
-                await new Promise(r => setTimeout(r, 1000));
-                break;
-              }
-            }
-
-            // Step 3: Find and click the target mode by matching first line of text
-            const items = document.querySelectorAll('[role="menuitemcheckbox"]');
-            debug.menuItems = Array.from(items).map(i => i.textContent?.trim().split('\n')[0]?.trim());
-            for (const item of items) {
-              const text = item.textContent?.trim();
-              const firstLine = text?.split('\n')[0]?.trim();
-              if (firstLine?.toLowerCase() === modeName?.toLowerCase()) {
-                item.click();
-                debug.clicked = { tag: item.tagName, text: text.substring(0, 50) };
-                console.log('[Claude Proxy] Selected mode:', modeName);
-                return { success: true, mode: modeName, debug };
-              }
-            }
-
-            return { error: modeName + ' not found in menu', debug };
-          },
-          args: [command.mode || 'Deep Research']
+          func: selectModeInPage,
+          args: [command.mode || 'Deep research']
         });
         result = result[0]?.result;
         break;
@@ -1658,58 +1711,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     chrome.scripting.executeScript({
       target: { tabId },
-      func: async (modeName) => {
-        const debug = {};
-        const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
-
-        // Step 1: Open Tools menu
-        let toolsBtn = findTools();
-        if (!toolsBtn) return { error: 'Tools button not found' };
-
-        toolsBtn.click();
-        await new Promise(r => setTimeout(r, 800));
-
-        // Step 2: Check if target is already active (toggle off) or deselect other mode
-        const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
-        for (const item of menuItems) {
-          if (item.getAttribute('aria-checked') === 'true') {
-            const checkedName = item.textContent?.trim().split('\n')[0]?.trim();
-            debug.deselected = checkedName;
-            item.click();
-            await new Promise(r => setTimeout(r, 1000));
-
-            // If toggling off the same mode, we're done
-            if (checkedName?.toLowerCase() === modeName?.toLowerCase()) {
-              return { success: true, mode: modeName, toggled: 'off', debug };
-            }
-
-            // Otherwise, re-open Tools to select the new mode
-            // Wait for DOM to settle after deselection
-            await new Promise(r => setTimeout(r, 500));
-            toolsBtn = findTools();
-            if (!toolsBtn) return { error: 'Tools button not found after deselect', debug };
-            toolsBtn.click();
-            await new Promise(r => setTimeout(r, 1000));
-            break;
-          }
-        }
-
-        // Step 3: Click target mode by matching first line of text
-        const items = document.querySelectorAll('[role="menuitemcheckbox"]');
-        debug.menuItems = Array.from(items).map(i => i.textContent?.trim().split('\n')[0]?.trim());
-        for (const item of items) {
-          const text = item.textContent?.trim();
-          const firstLine = text?.split('\n')[0]?.trim();
-          if (firstLine?.toLowerCase() === modeName?.toLowerCase()) {
-            item.click();
-            debug.clicked = { tag: item.tagName, text: text?.substring(0, 50) };
-            return { success: true, mode: modeName, debug };
-          }
-        }
-
-        return { error: modeName + ' not found in menu', debug };
-      },
-      args: [msg.mode || 'Deep Research']
+      func: selectModeInPage,
+      args: [msg.mode || 'Deep research']
     }).then(results => {
       sendResponse(results[0]?.result || { error: 'Script failed' });
     }).catch(e => {
