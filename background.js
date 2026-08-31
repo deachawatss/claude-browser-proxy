@@ -97,44 +97,51 @@ async function selectModeInPage(modeName) {
   const btn = findTools();
   if (!btn) return { error: 'Tools button not found' };
 
+  const wanted = (modeName || '').trim().toLowerCase();
+  const findItem = () => items().find(i => firstLine(i).toLowerCase() === wanted);
+
   // Open the menu and make sure it actually has items. An empty menu is the
   // lazy-load case, and closing and re-opening is what fills it, so retry rather
-  // than reporting the mode missing.
-  let opened = false;
-  for (let attempt = 1; attempt <= 3 && !opened; attempt++) {
-    if (!menuUp()) {
-      btn.click();
+  // than reporting the mode missing. Used both before clicking and again
+  // afterwards to re-read the result.
+  async function openMenuWithItems() {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (!menuUp()) {
+        btn.click();
+        let waited = 0;
+        while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
+      }
+      // Give the lazily-loaded content a chance to appear.
       let waited = 0;
-      while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
+      while (items().length === 0 && waited < 3000) { await sleep(250); waited += 250; }
+      debug.attempts.push({ attempt, menu: menuUp(), items: items().length });
+      if (items().length > 0) return true;
+      // Empty shell: close it, so the next pass re-opens a loaded menu.
+      if (menuUp()) { btn.click(); await sleep(500); }
     }
-    // Give the lazily-loaded content a chance to appear.
-    let waited = 0;
-    while (items().length === 0 && waited < 3000) { await sleep(250); waited += 250; }
-    debug.attempts.push({ attempt, menu: menuUp(), items: items().length });
-    if (items().length > 0) { opened = true; break; }
-    // Empty shell: close it, so the next pass re-opens a loaded menu.
-    if (menuUp()) { btn.click(); await sleep(500); }
+    return false;
   }
-  if (!opened) return { error: 'Tools menu opened but never rendered any items', debug };
-
-  const wanted = (modeName || '').trim().toLowerCase();
-  const find = () => items().find(i => firstLine(i).toLowerCase() === wanted);
 
   // Canvas / Deep research / Guided learning sit behind "More tools".
-  if (!find()) {
+  async function expandMoreTools() {
     const more = document.querySelector('[data-test-id="more-tools-button"]') ||
       items().concat(Array.from(document.querySelectorAll('button')))
              .find(el => /^more tools$/i.test(firstLine(el)));
-    if (more) {
-      debug.expandedMoreTools = true;
-      more.click();
-      let waited = 0;
-      while (!find() && waited < 3000) { await sleep(250); waited += 250; }
-    }
+    if (!more) return false;
+    debug.expandedMoreTools = true;
+    more.click();
+    let waited = 0;
+    while (!findItem() && waited < 3000) { await sleep(250); waited += 250; }
+    return true;
   }
 
+  if (!(await openMenuWithItems())) {
+    return { error: 'Tools menu opened but never rendered any items', debug };
+  }
+  if (!findItem()) await expandMoreTools();
+
   debug.visible = items().map(firstLine);
-  const target = find();
+  const target = findItem();
   if (!target) return { error: modeName + ' not found in menu', debug };
 
   const wasChecked = target.getAttribute('aria-checked') === 'true';
@@ -142,38 +149,44 @@ async function selectModeInPage(modeName) {
   await sleep(800);
 
   // Read the state back rather than assuming the click took. Selecting an item
-  // CLOSES the menu, so the item we just clicked is usually gone from the DOM by
-  // now and aria-checked cannot be re-read. Gemini puts the authoritative signal
-  // in the composer instead: while a mode is on, a button labelled
-  // "Deselect <mode>" is present, and it disappears when the mode goes off.
-  // Measured both ways on 2026-08-31 for Deep research.
-  const deselectFor = () => Array.from(document.querySelectorAll('button[aria-label]'))
-    .find(b => /^deselect /i.test(b.getAttribute('aria-label') || '') &&
-               (b.getAttribute('aria-label') || '').toLowerCase().includes(wanted));
-
-  const after = items().find(i => firstLine(i).toLowerCase() === wanted);
-  let nowChecked = null;
-  let verifiedBy = null;
-  if (after) {
-    nowChecked = after.getAttribute('aria-checked') === 'true';
-    verifiedBy = 'aria-checked';
-  } else {
-    // Wait briefly: the composer control appears as the menu animates away.
-    let waited = 0;
-    while (waited < 2000 && !deselectFor() && wasChecked === false) { await sleep(250); waited += 250; }
-    nowChecked = !!deselectFor();
-    verifiedBy = 'composer-deselect-button';
+  // CLOSES the menu, so re-open it and read the item's aria-checked. That is the
+  // authoritative, mode-independent signal.
+  //
+  // The composer chip is NOT usable for this. Gemini RENAMES modes there:
+  // "Create image" becomes a button labelled "Deselect Images". Matching the mode
+  // name against that label gave a false negative for four of the six modes on
+  // 2026-08-31 — the toggles worked, the check did not. Only Canvas and Deep
+  // research happen to keep their name.
+  async function readChecked() {
+    if (!(await openMenuWithItems())) return null;
+    let it = findItem();
+    if (!it) { await expandMoreTools(); it = findItem(); }
+    return it ? it.getAttribute('aria-checked') === 'true' : null;
   }
+
+  const nowChecked = await readChecked();
   debug.wasChecked = wasChecked;
   debug.nowChecked = nowChecked;
-  debug.verifiedBy = verifiedBy;
+  debug.verifiedBy = nowChecked === null ? 'none' : 'aria-checked-reread';
 
   if (menuUp()) {
-    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    btn.click();
+    await sleep(300);
   }
 
-  // Only claim success when the observed state actually changed. A dispatched
-  // click is not evidence.
+  // Only claim success when the observed state actually changed, and never claim
+  // it at all when the state could not be read. A dispatched click is not
+  // evidence.
+  if (nowChecked === null) {
+    return {
+      success: false,
+      verified: false,
+      mode: modeName,
+      toggled: 'unknown',
+      error: 'clicked ' + modeName + ' but could not re-read its state — treat as UNVERIFIED',
+      debug
+    };
+  }
   const changed = nowChecked !== wasChecked;
   return {
     success: changed,
@@ -248,6 +261,14 @@ async function uploadFileInPage(filename, mimeType, b64) {
   debug.accepts = accepts;
   debug.chosenIndex = idx;
 
+  // An attachment chip carries a "close <name>" button. Record the set BEFORE, so
+  // a NEW one is the evidence — a differential measurement that does not depend
+  // on knowing how Gemini will render the name.
+  const chipLabels = () => Array.from(document.querySelectorAll('button[aria-label]'))
+    .map(b => b.getAttribute('aria-label') || '')
+    .filter(l => /^close /i.test(l));
+  const before = new Set(chipLabels());
+
   const file = new File([bytes], filename, { type: mimeType || 'application/octet-stream' });
   const dt = new DataTransfer();
   dt.items.add(file);
@@ -257,26 +278,31 @@ async function uploadFileInPage(filename, mimeType, b64) {
   await sleep(500);
   if (menuUp()) { btn.click(); await sleep(300); }
 
-  // Confirm from the COMPOSER. Assigning `files` is not evidence the app took it;
-  // the attachment chip carrying the file name is.
-  const nameSeen = () =>
-    (document.body.innerText || '').includes(filename) ||
-    Array.from(document.querySelectorAll('[aria-label]'))
-      .some(e => (e.getAttribute('aria-label') || '').includes(filename));
+  // Confirm from the COMPOSER. Assigning `files` is not evidence the app took it.
+  //
+  // Do NOT match the file name: Gemini TRUNCATES it in the chip. A 25-character
+  // fixture came back as "close verify-fix...re-2053296" on 2026-08-31, so an
+  // exact-name check reported a successful upload as a failure.
   let waited = 0;
-  while (!nameSeen() && waited < 15000) { await sleep(500); waited += 500; }
-  const attached = nameSeen();
+  let addedChip = null;
+  while (waited < 20000 && !addedChip) {
+    addedChip = chipLabels().find(l => !before.has(l)) || null;
+    if (addedChip) break;
+    await sleep(500); waited += 500;
+  }
   debug.waitedMs = waited;
+  debug.chipsBefore = before.size;
 
   return {
-    success: attached,
-    attached,
+    success: !!addedChip,
+    attached: !!addedChip,
     verified: true,
     filename,
+    chipLabel: addedChip,
     bytes: bytes.length,
-    ...(attached ? {} : {
-      error: 'the file was handed to the input but "' + filename +
-             '" never appeared in the page — treat this as NOT attached'
+    ...(addedChip ? {} : {
+      error: 'the file was handed to the input but no new attachment chip appeared — ' +
+             'treat this as NOT attached'
     }),
     debug
   };
