@@ -24,7 +24,11 @@ const EXTENSION = resolve(HERE, '..');
 const PROFILE = process.env.GEMINI_PW_PROFILE
   || `${process.env.HOME}/.cache/gemini-proxy-pw-profile`;
 const CDP_PORT = process.env.GEMINI_PW_CDP_PORT || '9223';
-const READY_FILE = '/tmp/gemini-pw-harness.ready';
+// Keyed by port, because GEMINI_PW_PROFILE and GEMINI_PW_CDP_PORT make a second
+// instance possible and a shared constant made it destructive: a second harness
+// overwrote the first's ready file and then deleted it on exit, leaving a live
+// harness with no state and up.sh unable to see it. Observed 2026-08-31.
+const READY_FILE = `/tmp/gemini-pw-harness-${CDP_PORT}.ready`;
 const force = process.argv.includes('--force');
 
 // One bridge at a time. The extension's MQTT client id is a fixed string
@@ -101,22 +105,18 @@ if (signedOut === true) {
   console.warn('WARNING: could not read the page, so the sign-in state is unknown.');
 }
 
-// content.js paints its own tab id into the page ("TAB:12345"). That is how
-// this harness can tell whether the browser that answered the probe was THIS
-// one - a plain round trip cannot, because two bridges share one client id.
-const ownTabId = await (async () => {
-  for (let i = 0; i < 10; i++) {
-    const id = await page.evaluate(() => {
-      const el = document.querySelector('#claude-header-tab')
-        || document.querySelector('#claude-tab-inline');
-      const m = el?.textContent?.match(/TAB:\s*(\d+)/);
-      return m ? Number(m[1]) : null;
-    }).catch(() => null);
-    if (id) return id;
-    await page.waitForTimeout(1000);
-  }
+// Which tabs belong to THIS browser, asked of this browser's own extension.
+// Not scraped from the page: content.js paints a TAB:<id> badge, but it only
+// appears after a getTabId round trip and a retry interval that gives up after
+// five attempts, so a slow injection or a covering modal would make the page a
+// silent witness. A blocking modal is the exact condition this harness exists
+// to see, so the page is the wrong thing to depend on for ownership.
+const ownTabIds = await sw.evaluate(
+  () => chrome.tabs.query({}).then((tabs) => tabs.map((t) => t.id)),
+).catch((e) => {
+  console.error('could not ask the extension which tabs are ours:', String(e).split('\n')[0]);
   return null;
-})();
+});
 
 // Readiness is a round trip, not a flag: the extension has to answer a command
 // published by someone else before this harness calls itself up.
@@ -134,21 +134,20 @@ if (!answer) {
 // the whole probe, wake up afterwards, take the shared client id back, and
 // answer the readiness check itself. Gating the check on the prediction would
 // skip it in exactly that case.
-if (ownTabId === null) {
-  console.error('FAILED: cannot tell which browser answered.');
-  console.error('  content.js paints a TAB:<id> badge into the page and this one has none,');
-  console.error('  so ownership is unverifiable. Refusing rather than assuming it is ours.');
+if (!ownTabIds || ownTabIds.length === 0) {
+  console.error('FAILED: cannot tell which tabs are ours, so cannot tell who answered.');
+  console.error('  Refusing rather than assuming the answer was our own.');
   await ctx.close();
   process.exit(1);
 }
-if (answer.tabId !== ownTabId) {
+if (!ownTabIds.includes(answer.tabId)) {
   console.error('FAILED: the answer came from a different browser.');
-  console.error(`  our tab: ${ownTabId}, answering tab: ${answer.tabId}`);
+  console.error(`  our tabs: ${ownTabIds.join(', ')}, answering tab: ${answer.tabId}`);
   console.error('  Another bridge holds the MQTT client id. Stop it, then start again.');
   await ctx.close();
   process.exit(1);
 }
-console.log(`ownership verified: tab ${ownTabId} answered`);
+console.log(`ownership verified: tab ${answer.tabId} is one of ours`);
 
 writeFileSync(READY_FILE, JSON.stringify({
   pid: process.pid,
@@ -157,7 +156,7 @@ writeFileSync(READY_FILE, JSON.stringify({
   extension: EXTENSION,
   serviceWorker: sw.url(),
   signedOut,
-  tabId: ownTabId,
+  tabIds: ownTabIds,
   bridge: answer,
   started: new Date().toISOString(),
 }, null, 2));

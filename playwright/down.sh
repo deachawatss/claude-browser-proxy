@@ -3,8 +3,9 @@
 # a debugging session, may still be using that display.
 set -uo pipefail
 
-PIDFILE=/tmp/gemini-pw-harness.pid
-READY=/tmp/gemini-pw-harness.ready
+PORT="${GEMINI_PW_CDP_PORT:-9223}"
+PIDFILE="/tmp/gemini-pw-harness-$PORT.pid"
+READY="/tmp/gemini-pw-harness-$PORT.ready"
 DISP="${GEMINI_PW_DISPLAY:-:99}"
 
 # Same reasoning as up.sh: `kill -0` answers "does some process own this number",

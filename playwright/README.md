@@ -35,7 +35,7 @@ playwright/down.sh        # stop
 `package.json` pins both direct dependencies exactly. The lock file is not
 committed — the repo's `.gitignore` excludes it — so transitive versions float.
 
-`up.sh` prints `/tmp/gemini-pw-harness.ready`, which holds the CDP endpoint, the
+`up.sh` prints `/tmp/gemini-pw-harness-<port>.ready`, which holds the CDP endpoint, the
 profile path and the bridge's first answer.
 
 ## One bridge at a time
@@ -58,9 +58,16 @@ That refusal is a *prediction*, so it is never the last word. The startup probe
 listens for 6 seconds, while the extension in your Chrome runs on a ~24 second
 keepalive alarm — it can sleep through the whole probe, wake, take the shared
 client id back, and answer the readiness check itself. So the harness **always**
-requires the answering `tabId` to match its own, read from the `TAB:<id>` badge
-`content.js` paints into the page. If it cannot read that badge it refuses to
-start, rather than assume the answer was its own.
+checks that the answering `tabId` is one of its own.
+
+That list comes from the extension itself — `sw.evaluate(() => chrome.tabs.query(…))`
+against the MV3 service worker, not from anything painted into the page.
+`content.js` does paint a `TAB:<id>` badge, but only after a `getTabId` round
+trip and a retry interval that gives up after five attempts, so a covering modal
+or a slow injection could make the page a silent witness. A covering modal is
+the exact thing this harness exists to see; it is the wrong thing to depend on.
+If the extension cannot be asked, the harness refuses to start rather than
+assume the answer was its own.
 
 ## No window on your desktop
 
@@ -90,10 +97,21 @@ across runs. It was signed in by hand over noVNC on 2026-08-31 and Google
 accepted it.
 
 Google refuses browsers that advertise automation, so the harness launches with
-`ignoreDefaultArgs: ['--enable-automation']` and
-`--disable-blink-features=AutomationControlled`, which put `navigator.webdriver`
-back to `false`. If you ever wipe the profile, sign in again over noVNC as
-above — the harness warns when the profile is signed out.
+`--disable-blink-features=AutomationControlled`, which puts `navigator.webdriver`
+back to `false`. Measured across four launches on 2026-08-31:
+
+| Launch options | `navigator.webdriver` |
+|---|---|
+| neither | `true` |
+| `ignoreDefaultArgs: ['--enable-automation']` alone | `true` |
+| `--disable-blink-features=AutomationControlled` alone | `false` |
+| both | `false` |
+
+The `ignoreDefaultArgs` line does nothing — Playwright 1.62.1 never adds that
+switch — and it was in this file as the stated reason sign-in works. It is gone
+now. If you ever wipe the profile, sign in again over noVNC as above; the
+harness warns when the profile is signed out, and says "unknown" when it could
+not read the page at all.
 
 ## Health is a round trip, never a flag
 
