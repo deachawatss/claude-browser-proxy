@@ -185,6 +185,103 @@ async function selectModeInPage(modeName) {
   };
 }
 
+// Ceiling on an uploaded file. The bytes travel as base64 in an MQTT payload on a
+// RETAINED topic, so an unbounded blob is a hazard to the broker as well as slow.
+// Exceeding it is a clear error, never a hang.
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+
+// Injected into the Gemini page to attach a file to the composer.
+//
+// No native file dialog is involved and no new Chrome permission is needed. While
+// the Tools menu is open the page contains real input[type="file"] elements —
+// measured: 3 of them, and zero while the menu is shut. So this opens the menu,
+// builds a File from the bytes it was given, hands it to the input through a
+// DataTransfer, and fires `change`, which is what the app listens for.
+async function uploadFileInPage(filename, mimeType, b64) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const debug = { attempts: [] };
+  const findTools = () =>
+    document.querySelector('button[aria-label="Upload & tools"]') ||
+    document.querySelector('button[aria-label*="tools" i]') ||
+    Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === 'Tools');
+  const menuUp = () => document.querySelectorAll('[role="menu"]').length > 0;
+  const inputs = () => Array.from(document.querySelectorAll('input[type="file"]'));
+
+  let bytes;
+  try {
+    const bin = atob(b64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch (e) {
+    return { error: 'contentBase64 is not valid base64' };
+  }
+
+  const btn = findTools();
+  if (!btn) return { error: 'Tools button not found' };
+
+  // The file inputs live inside the menu, and the menu's content is lazily
+  // loaded — the first open renders an empty shell. Same retry as select_mode.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (!menuUp()) {
+      btn.click();
+      let w = 0;
+      while (!menuUp() && w < 5000) { await sleep(250); w += 250; }
+    }
+    let w = 0;
+    while (inputs().length === 0 && w < 3000) { await sleep(250); w += 250; }
+    debug.attempts.push({ attempt, menu: menuUp(), inputs: inputs().length });
+    if (inputs().length > 0) break;
+    if (menuUp()) { btn.click(); await sleep(500); }
+  }
+
+  const all = inputs();
+  if (!all.length) return { error: 'Tools menu opened but contained no file input', debug };
+
+  // Several inputs exist; pick the one whose accept covers this type, else the
+  // most permissive, and record which was chosen so a wrong pick is visible.
+  const accepts = all.map(i => (i.getAttribute('accept') || '').toLowerCase());
+  const typeLc = (mimeType || '').toLowerCase();
+  const family = typeLc.split('/')[0];
+  let idx = accepts.findIndex(a => a && typeLc && (a.includes(typeLc) || a.includes(family + '/*')));
+  if (idx < 0) idx = accepts.findIndex(a => !a || a === '*/*');
+  if (idx < 0) idx = 0;
+  debug.accepts = accepts;
+  debug.chosenIndex = idx;
+
+  const file = new File([bytes], filename, { type: mimeType || 'application/octet-stream' });
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  all[idx].files = dt.files;
+  all[idx].dispatchEvent(new Event('change', { bubbles: true }));
+
+  await sleep(500);
+  if (menuUp()) { btn.click(); await sleep(300); }
+
+  // Confirm from the COMPOSER. Assigning `files` is not evidence the app took it;
+  // the attachment chip carrying the file name is.
+  const nameSeen = () =>
+    (document.body.innerText || '').includes(filename) ||
+    Array.from(document.querySelectorAll('[aria-label]'))
+      .some(e => (e.getAttribute('aria-label') || '').includes(filename));
+  let waited = 0;
+  while (!nameSeen() && waited < 15000) { await sleep(500); waited += 500; }
+  const attached = nameSeen();
+  debug.waitedMs = waited;
+
+  return {
+    success: attached,
+    attached,
+    verified: true,
+    filename,
+    bytes: bytes.length,
+    ...(attached ? {} : {
+      error: 'the file was handed to the input but "' + filename +
+             '" never appeared in the page — treat this as NOT attached'
+    }),
+    debug
+  };
+}
+
 // Actions routed to a Messenger tab instead of a Gemini tab
 const MESSENGER_ACTIONS = new Set(['list_chats', 'index_chat', 'get_index_status', 'read_chat', 'send_chat_message']);
 
@@ -1269,6 +1366,24 @@ Use double newlines between timestamps!`;
             return res;
           },
           args: [wantDump]
+        });
+        result = result[0]?.result;
+        break;
+      }
+
+      case 'upload_file': {
+        if (!command.filename) { result = { error: 'upload_file requires "filename"' }; break; }
+        if (!command.contentBase64) { result = { error: 'upload_file requires "contentBase64"' }; break; }
+        // Reject oversize before shipping the string into the page.
+        const approxBytes = Math.floor(command.contentBase64.length * 3 / 4);
+        if (approxBytes > MAX_UPLOAD_BYTES) {
+          result = { error: 'file is about ' + approxBytes + ' bytes, over the ' + MAX_UPLOAD_BYTES + ' byte limit' };
+          break;
+        }
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: uploadFileInPage,
+          args: [command.filename, command.mimeType || '', command.contentBase64]
         });
         result = result[0]?.result;
         break;
