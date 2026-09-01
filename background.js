@@ -33,9 +33,25 @@ let isSubscribed = false;
 
 // Subscribe at QoS 1 so the broker queues commands published while we are asleep.
 // Re-callable: the keepalive alarm uses it to repair a lost subscription.
+//
+// The OBJECT form with resubscribe:true, deliberately. Given a plain topic
+// string, mqtt.js short-circuits any subscribe for a topic it already holds:
+// it sends no packet and calls back with an EMPTY granted array
+// (mqtt.js 5.14.1 - `if (!subs.length) return callback(null, []), this`). The
+// check below read that as a refusal, so the keepalive's own repair call at the
+// bottom of this file turned a healthy `true` into a permanent `false` on its
+// first run. Measured 2026-08-31: 29 consecutive status publishes said
+// subscribed:false while every command was answered.
+//
+// Reading [] as "already subscribed" would have been the smaller fix and the
+// wrong one - that is mqtt.js's own bookkeeping, which cannot notice a broker
+// restart that dropped the session. resubscribe:true forces a real SUBSCRIBE
+// and a real SUBACK every time, so this flag reports what the BROKER confirmed.
+// Note the object form is required: mqtt.js only reads `resubscribe` when the
+// first argument is an object, never when it is a string.
 function subscribeToCommands() {
   if (!client) return;
-  client.subscribe(TOPICS.command, { qos: 1 }, (err, granted) => {
+  client.subscribe({ [TOPICS.command]: { qos: 1 }, resubscribe: true }, (err, granted) => {
     if (err) {
       isSubscribed = false;
       console.error('[MQTT] Subscribe error:', err);
@@ -370,6 +386,27 @@ function navigateAndWait(tabId, url, timeoutMs = 15000) {
 // Connect to MQTT broker with LWT
 function connect() {
   console.log('[MQTT] Connecting to', MQTT_URL);
+
+  // End the previous client before making another one. Without this, every
+  // keepalive that finds isConnected false builds ANOTHER mqtt client while the
+  // old one keeps its own 5s reconnect timer forever. They all share
+  // MQTT_CLIENT_ID, so each orphan's reconnect evicts the live one - mosquitto
+  // logs "Client claude-browser-proxy already connected, closing old
+  // connection" - which sets isConnected false, which makes the next alarm
+  // build yet another client. It compounds.
+  //
+  // Observed 2026-09-01 after a broker restart: connections arriving at 2/sec
+  // against a 5s reconnect period, ~2 status publishes per second, and a bridge
+  // that answered nothing until the extension was reloaded by hand. A broker
+  // restart is ordinary maintenance; it should not need a human with a mouse.
+  if (client) {
+    try {
+      client.end(true);
+    } catch (e) {
+      console.warn('[MQTT] could not end the previous client:', e);
+    }
+    client = null;
+  }
 
   client = mqtt.connect(MQTT_URL, {
     // A STABLE client id, deliberately. It used to be 'claude-browser-' + Date.now(),
@@ -1335,6 +1372,29 @@ Use double newlines between timestamps!`;
           loaded, composerReady,
           ...(loaded && composerReady ? {} : { error: 'tab reloaded but the composer never appeared' })
         };
+        break;
+      }
+
+      case 'reload_extension': {
+        // Reload the extension from disk, from the CLI, with no human at the
+        // keyboard. Chrome loads this extension unpacked, so a code change on
+        // disk needs the extension reloaded before it runs - and until now that
+        // meant Wind clicking reload in chrome://extensions, about eight times
+        // in the 2026-08-31 session alone. That is the root cause of the reload
+        // dance, not a nuisance around it.
+        //
+        // Safe because nothing here depends on a surviving content script:
+        // every command reaches the page through chrome.scripting.executeScript
+        // (36 call sites; zero chrome.tabs.sendMessage), which injects fresh
+        // code each time. The injected TAB badge and buttons do disappear until
+        // the tab is reloaded - `reload_tab` is there for that, and nothing
+        // else needs it.
+        //
+        // The delay is not decoration: chrome.runtime.reload() tears down this
+        // worker, so the response has to be on the socket before it fires.
+        // Nothing can publish afterwards.
+        result = { success: true, reloading: true, version: VERSION };
+        setTimeout(() => chrome.runtime.reload(), 750);
         break;
       }
 
