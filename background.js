@@ -1463,8 +1463,8 @@ Use double newlines between timestamps!`;
         // Reload the extension from disk, from the CLI, with no human at the
         // keyboard. Chrome loads this extension unpacked, so a code change on
         // disk needs the extension reloaded before it runs - and until now that
-        // meant a human clicking reload in chrome://extensions, about eight times
-        // in a single session. That is the root cause of the reload
+        // meant a human clicking reload in chrome://extensions, about eight
+        // times in a single session. That is the root cause of the reload
         // dance, not a nuisance around it.
         //
         // Safe because nothing here depends on a surviving content script:
