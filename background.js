@@ -113,8 +113,8 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 // to be byte-identical to main). `focus_tab` fixed it in one command.
 //
 // So: say so in one second instead of hanging for ninety. Deliberately NOT
-// auto-focusing - stealing the window from under Wind is the "why you stucking in
-// loop?" failure of 2026-08-31. The caller is told exactly which command fixes it.
+// auto-focusing - stealing the window from under the person using it is its own
+// failure mode. The caller is told exactly which command fixes it.
 async function menuBlockedByUnfocusedWindow(tab) {
   let win;
   try {
@@ -1320,7 +1320,7 @@ Use double newlines between timestamps!`;
         // So a host permission for the exact site is NOT enough - it is a static
         // check. `activeTab` would also satisfy it, but that is granted only by a
         // real user gesture, and a command arriving over MQTT has none. Hence
-        // <all_urls>, and hence it being OPTIONAL: Wind grants it with one click
+        // <all_urls>, and hence it being OPTIONAL: the user grants it with one click
         // on the side panel's Screenshot button and can revoke it any time in
         // chrome://extensions. It is not claimed at install.
         // Attempt the capture and let it be the test. `permissions.contains`
@@ -1463,8 +1463,8 @@ Use double newlines between timestamps!`;
         // Reload the extension from disk, from the CLI, with no human at the
         // keyboard. Chrome loads this extension unpacked, so a code change on
         // disk needs the extension reloaded before it runs - and until now that
-        // meant Wind clicking reload in chrome://extensions, about eight times
-        // in the 2026-08-31 session alone. That is the root cause of the reload
+        // meant a human clicking reload in chrome://extensions, about eight
+        // times in a single session. That is the root cause of the reload
         // dance, not a nuisance around it.
         //
         // Safe because nothing here depends on a surviving content script:
