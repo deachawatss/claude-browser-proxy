@@ -1333,7 +1333,13 @@ Use double newlines between timestamps!`;
           break;
         }
 
-        const shot = await chrome.tabs.captureVisibleTab();
+        // format:'png' explicitly. The default is JPEG, and chrome.downloads then
+        // corrects the extension to match the real mime type - so the response
+        // announced "screenshot-<ts>.png" while the file on disk was .jpg. A
+        // response naming a file that does not exist is the same failure this
+        // repo keeps finding elsewhere; PNG is also the right choice for reading
+        // UI text, which is the whole purpose of the capture.
+        const shot = await chrome.tabs.captureVisibleTab({ format: 'png' });
         // Saved as a file rather than published: a PNG data URL is ~68KB of
         // base64, and the point is for the caller to LOOK at it, which means it
         // has to become a file somewhere anyway.
