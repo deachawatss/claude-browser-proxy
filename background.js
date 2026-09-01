@@ -14,9 +14,453 @@ const TOPICS = {
   state: 'claude/browser/state'  // Loading/tool state
 };
 
+// Stable across reconnects and across worker restarts, so the broker can resume
+// our session and hold the command subscription while the MV3 worker is suspended.
+const MQTT_CLIENT_ID = 'claude-browser-proxy';
+// How old a command may be and still run. Long enough to cover a worker nap and
+// the broker's redelivery, short enough that yesterday's queued command never
+// fires at you. Only applies to commands that carry a `ts`.
+const MAX_COMMAND_AGE_MS = 120000;
+
 let client = null;
 let isConnected = false;
-let connectedAt = 0; // Track connection time to ignore stale retained messages
+// Whether the broker has confirmed our subscription to the command topic.
+// Tracked separately from isConnected because the two failed apart on
+// 2026-08-31: the extension kept publishing keepalive "online" for hours while
+// nothing was subscribed, so every command was dropped and the status topic
+// still said the bridge was healthy. Publishing is not the same as listening.
+let isSubscribed = false;
+
+// Subscribe at QoS 1 so the broker queues commands published while we are asleep.
+// Re-callable: the keepalive alarm uses it to repair a lost subscription.
+//
+// The OBJECT form with resubscribe:true, deliberately. Given a plain topic
+// string, mqtt.js short-circuits any subscribe for a topic it already holds:
+// it sends no packet and calls back with an EMPTY granted array
+// (mqtt.js 5.14.1 - `if (!subs.length) return callback(null, []), this`). The
+// check below read that as a refusal, so the keepalive's own repair call at the
+// bottom of this file turned a healthy `true` into a permanent `false` on its
+// first run. Measured 2026-08-31: 29 consecutive status publishes said
+// subscribed:false while every command was answered.
+//
+// Reading [] as "already subscribed" would have been the smaller fix and the
+// wrong one - that is mqtt.js's own bookkeeping, which cannot notice a broker
+// restart that dropped the session. resubscribe:true forces a real SUBSCRIBE
+// and a real SUBACK every time, so this flag reports what the BROKER confirmed.
+// Note the object form is required: mqtt.js only reads `resubscribe` when the
+// first argument is an object, never when it is a string.
+function subscribeToCommands() {
+  if (!client) return;
+  client.subscribe({ [TOPICS.command]: { qos: 1 }, resubscribe: true }, (err, granted) => {
+    if (err) {
+      isSubscribed = false;
+      console.error('[MQTT] Subscribe error:', err);
+    } else {
+      // A granted qos of 128 means the broker refused the subscription.
+      const ok = Array.isArray(granted) && granted.length > 0 && granted[0].qos !== 128;
+      isSubscribed = ok;
+      console.log('[MQTT]', ok ? 'Subscribed to' : 'Subscription REFUSED for', TOPICS.command);
+    }
+    publishStatus();
+  });
+}
+
+// One place that builds the status payload, so `subscribed` can never be
+// omitted by a caller that only cares about liveness.
+function publishStatus(extra) {
+  if (!client) return;
+  try {
+    client.publish(TOPICS.status, JSON.stringify({
+      status: 'online',
+      subscribed: isSubscribed,   // false here means commands are being dropped
+      clientId: MQTT_CLIENT_ID,
+      timestamp: Date.now(),
+      version: VERSION,
+      ...(extra || {})
+    }), { retain: true });
+  } catch (e) { /* next alarm retries */ }
+}
+
+// Ceiling on an uploaded file. The bytes travel as base64 in an MQTT payload on a
+// RETAINED topic, so an unbounded blob is a hazard to the broker as well as slow.
+// Exceeding it is a clear error, never a hang.
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+
+// THE ONE page-side helper for the Tools menu. Every menu-driven action goes
+// through it: listing, toggling a mode, attaching a file, and clearing whatever
+// mode is active.
+//
+// Why one function and not four helpers. These run inside the page via
+// chrome.scripting.executeScript, which serialises a SINGLE function and gives it
+// no access to module scope. So a shared helper cannot be imported — the only way
+// to share the open-menu logic is for the callers to share the function itself and
+// branch on an operation. Four near-copies existed before this (selectModeInPage,
+// uploadFileInPage, the list_modes case, and sidepanel.js's New Chat handler), and
+// they had already drifted: the sidepanel copy still clicked once, slept 800ms and
+// read, which is the exact lazy-render bug fixed everywhere else, so its "deselect
+// the active mode" step failed silently on a cold menu.
+//
+// op is one of: 'list' | 'select' | 'upload' | 'deselect-active'
+// Chrome throttles rendering in a window that is not focused, and Gemini's Tools
+// menu is an overlay that never finishes opening there. Every menuOpInPage caller
+// then waits out its own timeout and answers nothing, which is indistinguishable
+// from a dead bridge.
+//
+// That is not hypothetical: on 2026-09-01 it failed 20+ checks of
+// verify-menu-actions.sh with EMPTY responses while `get_url` answered in
+// milliseconds and the status topic said subscribed:true. The diagnosis cost an
+// hour and two wrong theories (output buffering, then a refactor that turned out
+// to be byte-identical to main). `focus_tab` fixed it in one command.
+//
+// So: say so in one second instead of hanging for ninety. Deliberately NOT
+// auto-focusing - stealing the window from under the person using it is its own
+// failure mode. The caller is told exactly which command fixes it.
+async function menuBlockedByUnfocusedWindow(tab) {
+  let win;
+  try {
+    win = await chrome.windows.get(tab.windowId);
+  } catch (e) {
+    return null; // cannot tell - proceed rather than block on a guess
+  }
+  if (win.focused) return null;
+  return {
+    success: false,
+    error: 'the browser window holding the Gemini tab is not focused, so its Tools menu will not render',
+    fix: `send {"action":"focus_tab","tabId":${tab.id}} first, or click that window`,
+    windowId: tab.windowId,
+  };
+}
+
+// ONE page-side implementation of model selection, for the same reason
+// menuOpInPage exists: an injected function cannot close over module scope, so the
+// only way to share it is for both callers to inject the same function.
+//
+// There were two copies before this - the MQTT `select_model` case and the
+// runtime-message handler the on-page buttons use - and they had already drifted.
+// This copy matches the menu item's TITLE line, because "pro" otherwise also hits
+// "Complex problem solving" under Extended thinking; the content-script copy still
+// used a loose startsWith and would pick the wrong model. Issue #18.
+async function selectModelInPage(modelName) {
+  const allBtns = Array.from(document.querySelectorAll('button'));
+  const debug = { totalButtons: allBtns.length, candidates: [] };
+
+  let dropdownBtn = null;
+  // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
+  dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
+  if (dropdownBtn) debug.foundBy = 'bard-mode-menu-button-testid';
+
+  // FALLBACK: legacy class (button.input-area-switch is the same element today, kept for A/B)
+  if (!dropdownBtn) {
+    dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
+    if (dropdownBtn) debug.foundBy = 'input-area-switch';
+  }
+
+  if (!dropdownBtn) {
+    dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
+    if (dropdownBtn) debug.foundBy = 'text-match';
+  }
+
+  if (!dropdownBtn) {
+    dropdownBtn = allBtns.find(b => b.parentElement?.className?.includes('pill-ui'));
+    if (dropdownBtn) debug.foundBy = 'pill-ui-parent';
+  }
+
+  if (!dropdownBtn) {
+    return { error: 'Model dropdown not found', debug, request: modelName };
+  }
+
+  debug.clickedButton = { class: dropdownBtn.className.substring(0, 50), text: dropdownBtn.textContent.trim() };
+  dropdownBtn.click();
+  await new Promise(r => setTimeout(r, 600));
+
+  const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
+  const targetModel = modelMap[modelName.toLowerCase()] || modelName;
+
+  // Current Gemini model menu (verified live 2026-08): role="menuitem" items titled
+  // "3.5 Flash-Lite", "3.6 Flash", "3.1 Pro", "Extended thinking", each with a second
+  // description line. Match the TITLE (first line) not the whole textContent, else
+  // 'pro' would also hit "Complex problem solving" under Extended thinking. Case-
+  // insensitive because Gemini re-cases labels (e.g. "Extended thinking").
+  const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="listbox"] button, .mat-mdc-menu-item');
+  const wantLc = targetModel.toLowerCase();
+  const titleOf = (el) => ((el.textContent || '').trim().split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
+  let chosen = [...options].find(o => titleOf(o).toLowerCase().includes(wantLc));
+  if (!chosen) chosen = [...options].find(o => (o.textContent || '').toLowerCase().includes(wantLc));
+  if (chosen) {
+    chosen.click();
+    return { success: true, model: targetModel, debug, request: modelName };
+  }
+
+  const allClickables = document.querySelectorAll('button, div[role="option"], .mdc-list-item');
+  for (const el of allClickables) {
+    if (el.textContent.trim().startsWith(targetModel) && el !== dropdownBtn) {
+      el.click();
+      return { success: true, model: targetModel, debug, request: modelName };
+    }
+  }
+
+  return { error: 'Model option not found: ' + targetModel, debug, request: modelName };
+}
+
+
+async function menuOpInPage(op, arg) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const debug = { op, attempts: [] };
+  const firstLine = el => ((el.textContent || '').trim().split('\n')[0] || '').trim();
+  const visible = el => el && el.offsetParent !== null;
+
+  // Fallback chain recorded in docs/GEMINI-SELECTORS.md. Never delete one.
+  const findTools = () =>
+    document.querySelector('button[aria-label="Upload & tools"]') ||
+    document.querySelector('button[aria-label*="tools" i]') ||
+    Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim() === 'Tools');
+
+  const menuUp = () => document.querySelectorAll('[role="menu"]').length > 0;
+  const items = () => Array.from(document.querySelectorAll('[role="menuitemcheckbox"]'));
+  const inputs = () => Array.from(document.querySelectorAll('input[type="file"]'));
+  // Gemini has moved modes between roles before, so accept all of them.
+  const ITEM_SEL = '[role="menuitemcheckbox"],[role="menuitem"],[role="menuitemradio"],[role="option"]';
+  const anyItem = () => Array.from(document.querySelectorAll(ITEM_SEL)).filter(visible);
+
+  const btn = findTools();
+  if (!btn) return { ok: false, error: 'Tools button not found', debug };
+
+  // Open the menu and make sure it actually HAS content. The menu's content is
+  // lazily loaded: the first open renders an empty shell — measured 2 descendant
+  // elements and zero items, where a later open renders 88. Closing and re-opening
+  // is what fills it, so retry rather than reporting the content missing.
+  // `hasContent` differs per op because upload waits on file inputs, not items.
+  async function openMenuWithContent(hasContent) {
+    const wasOpen = menuUp();
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (!menuUp()) {
+        btn.click();
+        let waited = 0;
+        while (!menuUp() && waited < 5000) { await sleep(250); waited += 250; }
+      }
+      let waited = 0;
+      while (!hasContent() && waited < 3000) { await sleep(250); waited += 250; }
+      debug.attempts.push({ attempt, menu: menuUp(), content: hasContent() });
+      if (hasContent()) { debug.alreadyOpen = wasOpen; return true; }
+      // Empty shell: close it, so the next pass re-opens a loaded menu.
+      if (menuUp()) { btn.click(); await sleep(500); }
+    }
+    debug.alreadyOpen = wasOpen;
+    return false;
+  }
+
+  // Canvas / Deep research / Guided learning sit behind this submenu.
+  async function expandMoreTools(found) {
+    const more = document.querySelector('[data-test-id="more-tools-button"]') ||
+      anyItem().concat(Array.from(document.querySelectorAll('button')))
+               .find(el => /^more tools$/i.test(firstLine(el)));
+    if (!more) return false;
+    debug.expandedMoreTools = true;
+    more.click();
+    let waited = 0;
+    while (!found() && waited < 3000) { await sleep(250); waited += 250; }
+    return true;
+  }
+
+  function closeMenu() {
+    if (menuUp()) btn.click();
+  }
+
+  // Selecting a tool while the current conversation already has content raises
+  // "Start a new chat? Selecting this tool will start a new chat." Until it is
+  // answered the mode does NOT change, so an unattended run fails silently.
+  // Confirming is what a person clicking that tool would get; it is reported so a
+  // caller is never surprised by a conversation switch it did not ask for.
+  async function confirmNewChatIfAsked() {
+    let waited = 0;
+    while (waited < 3000) {
+      const dlg = Array.from(document.querySelectorAll('[role="dialog"]'))
+        .find(d => /start a new chat/i.test(d.textContent || ''));
+      if (dlg) {
+        const go = Array.from(dlg.querySelectorAll('button'))
+          .find(b => /^new chat$/i.test((b.textContent || '').trim()));
+        if (go) { go.click(); await sleep(1500); return true; }
+      }
+      await sleep(250); waited += 250;
+    }
+    return false;
+  }
+
+  // The composer's "Deselect <mode>" set changes the moment a mode flips, and
+  // reading it needs no menu. Note Gemini RENAMES modes here — "Create image"
+  // becomes "Deselect Images" — so only the SET is trustworthy, never the name.
+  const deselectSet = () => Array.from(document.querySelectorAll('button[aria-label]'))
+    .map(b => b.getAttribute('aria-label') || '')
+    .filter(l => /^deselect /i.test(l))
+    .sort().join('|');
+
+  // ---- list / dump ------------------------------------------------------
+  if (op === 'list' || op === 'dump') {
+    if (!(await openMenuWithContent(() => anyItem().length > 0))) {
+      closeMenu();
+      return { ok: false, menuOpened: menuUp(), debug,
+               error: 'Tools menu never rendered any items — treat this as NO MEASUREMENT, not an empty menu' };
+    }
+    const collect = () => anyItem().map(el => ({
+      label: firstLine(el),
+      role: el.getAttribute('role'),
+      checked: el.getAttribute('aria-checked'),
+      haspopup: el.getAttribute('aria-haspopup'),
+      disabled: el.getAttribute('aria-disabled')
+    })).filter(m => m.label);
+
+    const passes = [collect()];
+    await expandMoreTools(() => false);
+    passes.push(collect());
+
+    const menuHtml = op === 'dump'
+      ? Array.from(document.querySelectorAll('[role="menu"]')).map(m => m.outerHTML.substring(0, 6000))
+      : undefined;
+
+    const seen = new Map();
+    passes.forEach(list => list.forEach(m => {
+      if (!seen.has(m.label.toLowerCase())) seen.set(m.label.toLowerCase(), m);
+    }));
+    const found = Array.from(seen.values());
+    closeMenu();
+    const res = { ok: true, menuOpened: true, count: found.length,
+                  modes: found.map(i => i.label), passCounts: passes.map(p => p.length), debug };
+    if (op === 'dump') { res.items = found; res.menuHtml = menuHtml; }
+    return res;
+  }
+
+  // ---- upload -----------------------------------------------------------
+  if (op === 'upload') {
+    const { filename, mimeType, b64 } = arg || {};
+    let bytes;
+    try {
+      const bin = atob(b64);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (e) {
+      return { success: false, attached: false, error: 'contentBase64 is not valid base64', debug };
+    }
+
+    if (!(await openMenuWithContent(() => inputs().length > 0))) {
+      closeMenu();
+      return { success: false, attached: false, error: 'Tools menu opened but contained no file input', debug };
+    }
+
+    const all = inputs();
+    const accepts = all.map(i => (i.getAttribute('accept') || '').toLowerCase());
+    const typeLc = (mimeType || '').toLowerCase();
+    const family = typeLc.split('/')[0];
+    let idx = accepts.findIndex(a => a && typeLc && (a.includes(typeLc) || a.includes(family + '/*')));
+    if (idx < 0) idx = accepts.findIndex(a => !a || a === '*/*');
+    if (idx < 0) idx = 0;
+    debug.accepts = accepts;
+    debug.chosenIndex = idx;
+
+    // An attachment chip carries a "close <name>" button. Record the set BEFORE,
+    // so a NEW one is the evidence. Do NOT match the file name: Gemini truncates
+    // it ("close verify-fix...re-2053296") and drops the extension.
+    const chipLabels = () => Array.from(document.querySelectorAll('button[aria-label]'))
+      .map(b => b.getAttribute('aria-label') || '')
+      .filter(l => /^close /i.test(l));
+    const before = new Set(chipLabels());
+
+    const file = new File([bytes], filename, { type: mimeType || 'application/octet-stream' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    all[idx].files = dt.files;
+    all[idx].dispatchEvent(new Event('change', { bubbles: true }));
+
+    await sleep(500);
+    closeMenu();
+
+    let waited = 0;
+    let addedChip = null;
+    while (waited < 20000 && !addedChip) {
+      addedChip = chipLabels().find(l => !before.has(l)) || null;
+      if (addedChip) break;
+      await sleep(500); waited += 500;
+    }
+    debug.waitedMs = waited;
+    debug.chipsBefore = before.size;
+    return {
+      success: !!addedChip, attached: !!addedChip, verified: true,
+      filename, chipLabel: addedChip, bytes: bytes.length,
+      ...(addedChip ? {} : {
+        error: 'the file was handed to the input but no new attachment chip appeared — treat this as NOT attached'
+      }),
+      debug
+    };
+  }
+
+  // ---- select / deselect-active ----------------------------------------
+  const wanted = op === 'select' ? String(arg || '').trim().toLowerCase() : null;
+  const findItem = () => wanted
+    ? items().find(i => firstLine(i).toLowerCase() === wanted)
+    : items().find(i => i.getAttribute('aria-checked') === 'true');
+
+  if (!(await openMenuWithContent(() => items().length > 0))) {
+    closeMenu();
+    return { success: false, verified: false, error: 'Tools menu opened but never rendered any items', debug };
+  }
+  if (!findItem()) await expandMoreTools(findItem);
+  debug.visible = items().map(firstLine);
+
+  const target = findItem();
+  if (!target) {
+    closeMenu();
+    if (op === 'deselect-active') return { success: true, verified: true, cleared: null, debug };
+    return { success: false, verified: true, error: arg + ' not found in menu', debug };
+  }
+
+  const clearedName = firstLine(target);
+  const deselectBefore = deselectSet();
+  const wasChecked = target.getAttribute('aria-checked') === 'true';
+  target.click();
+  await sleep(400);
+  debug.startedNewChat = await confirmNewChatIfAsked();
+
+  // Wait for the click to take effect, keyed to an observable change rather than
+  // a fixed sleep. Measured: the FIRST toggle after a conversation change lags,
+  // and a flat 800ms read saw the OLD value, shifting a whole run by one.
+  let settle = 0;
+  while (settle < 8000 && deselectSet() === deselectBefore) { await sleep(250); settle += 250; }
+  debug.settleMs = settle;
+  debug.settled = deselectSet() !== deselectBefore;
+
+  if (op === 'deselect-active') {
+    closeMenu();
+    return { success: true, verified: true, cleared: clearedName, debug };
+  }
+
+  // Re-open and re-read aria-checked. That is authoritative and identical for all
+  // six modes, unlike the composer chip whose label Gemini rewrites.
+  let nowChecked = null;
+  if (await openMenuWithContent(() => items().length > 0)) {
+    let it = findItem();
+    if (!it) { await expandMoreTools(findItem); it = findItem(); }
+    if (it) nowChecked = it.getAttribute('aria-checked') === 'true';
+  }
+  debug.wasChecked = wasChecked;
+  debug.nowChecked = nowChecked;
+  debug.verifiedBy = nowChecked === null ? 'none' : 'aria-checked-reread';
+  closeMenu();
+
+  if (nowChecked === null) {
+    return { success: false, verified: false, mode: arg, toggled: 'unknown',
+             startedNewChat: !!debug.startedNewChat,
+             error: 'clicked ' + arg + ' but could not re-read its state — treat as UNVERIFIED', debug };
+  }
+  const changed = nowChecked !== wasChecked;
+  return {
+    success: changed,
+    verified: true,
+    mode: arg,
+    startedNewChat: !!debug.startedNewChat,
+    toggled: nowChecked ? 'on' : 'off',
+    ...(changed ? {} : { error: 'clicked ' + arg + ' but its state did not change' }),
+    debug
+  };
+}
 
 // Actions routed to a Messenger tab instead of a Gemini tab
 const MESSENGER_ACTIONS = new Set(['list_chats', 'index_chat', 'get_index_status', 'read_chat', 'send_chat_message']);
@@ -45,8 +489,38 @@ function navigateAndWait(tabId, url, timeoutMs = 15000) {
 function connect() {
   console.log('[MQTT] Connecting to', MQTT_URL);
 
+  // End the previous client before making another one. Without this, every
+  // keepalive that finds isConnected false builds ANOTHER mqtt client while the
+  // old one keeps its own 5s reconnect timer forever. They all share
+  // MQTT_CLIENT_ID, so each orphan's reconnect evicts the live one - mosquitto
+  // logs "Client claude-browser-proxy already connected, closing old
+  // connection" - which sets isConnected false, which makes the next alarm
+  // build yet another client. It compounds.
+  //
+  // Observed 2026-09-01 after a broker restart: connections arriving at 2/sec
+  // against a 5s reconnect period, ~2 status publishes per second, and a bridge
+  // that answered nothing until the extension was reloaded by hand. A broker
+  // restart is ordinary maintenance; it should not need a human with a mouse.
+  if (client) {
+    try {
+      client.end(true);
+    } catch (e) {
+      console.warn('[MQTT] could not end the previous client:', e);
+    }
+    client = null;
+  }
+
   client = mqtt.connect(MQTT_URL, {
-    clientId: 'claude-browser-' + Date.now(),
+    // A STABLE client id, deliberately. It used to be 'claude-browser-' + Date.now(),
+    // which gave the broker a brand-new identity on every reconnect, so it could never
+    // resume a session or hold a subscription on our behalf.
+    clientId: MQTT_CLIENT_ID,
+    // Persistent session. Chrome suspends an MV3 worker between alarms; with a clean
+    // session the broker forgets our subscription the moment the socket drops and every
+    // command sent in that window is lost with no trace. clean:false makes the broker
+    // keep the subscription and queue QoS>=1 commands until we wake.
+    // NOTE: the publisher must also send at QoS>=1 — QoS 0 messages are never queued.
+    clean: false,
     keepalive: 15, // 15 seconds - LWT triggers after ~22 sec if no ping
     reconnectPeriod: 5000, // Reconnect every 5 seconds
     will: {
@@ -60,21 +534,11 @@ function connect() {
   client.on('connect', () => {
     console.log('[MQTT] Connected!');
     isConnected = true;
-    connectedAt = Date.now(); // Track connection time
     updateBadge(true);
-
-    // Subscribe to command topic
-    client.subscribe(TOPICS.command, (err) => {
-      if (err) console.error('[MQTT] Subscribe error:', err);
-      else console.log('[MQTT] Subscribed to', TOPICS.command);
-    });
+    subscribeToCommands();
 
     // Publish "online" status (retained) - overrides LWT "offline"
-    client.publish(TOPICS.status, JSON.stringify({
-      status: 'online',
-      timestamp: Date.now(),
-      version: VERSION
-    }), { retain: true });
+    publishStatus();
 
     // Push current mode/model state (retained) so consoles start in sync
     chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
@@ -88,9 +552,17 @@ function connect() {
     try {
       const command = JSON.parse(message.toString());
 
-      // Ignore stale retained messages (older than our connection)
-      if (command.ts && command.ts < connectedAt) {
-        console.log('[MQTT] Ignoring stale message (ts:', command.ts, '< connected:', connectedAt, ')');
+      // Drop stale commands — but by AGE, not by connection time.
+      //
+      // This used to be `command.ts < connectedAt`, which is wrong now that the
+      // session is persistent: the broker deliberately holds commands while the
+      // MV3 worker is suspended and delivers them on reconnect, so every rescued
+      // command necessarily predates the new connection and would be thrown away
+      // by that test — silently undoing the queuing it was paired with.
+      // An age limit keeps the original intent (never replay an ancient retained
+      // command) while letting a command queued during a worker nap through.
+      if (command.ts && (Date.now() - command.ts) > MAX_COMMAND_AGE_MS) {
+        console.log('[MQTT] Ignoring stale command, age', Date.now() - command.ts, 'ms >', MAX_COMMAND_AGE_MS);
         return;
       }
 
@@ -103,6 +575,9 @@ function connect() {
   client.on('close', () => {
     console.log('[MQTT] Disconnected');
     isConnected = false;
+    // The subscription does not survive a dropped socket from our side either;
+    // clearing it here is what lets the keepalive notice and repair it.
+    isSubscribed = false;
     updateBadge(false);
   });
 
@@ -134,12 +609,21 @@ async function publishModeState(tabId) {
         let model = b ? (b.getAttribute('aria-label') || '') : '';
         const i = model.toLowerCase().indexOf('currently');
         model = (i >= 0 ? model.slice(i + 9) : model).replace(/\s+/g, ' ').trim();
+        // This reads the composer's quick-pill row, NOT the Tools menu — the menu
+        // is shut at this point and its items are not in the DOM. Two facts follow,
+        // and both were mistaken for evidence about the menu on 2026-08-30:
+        //   1. a mode that lives only inside the menu can never appear here;
+        //   2. the pills are A/B tested, so two accounts legitimately differ.
+        // The hardcoded name list below can also only ever return names we already
+        // expected, so it cannot discover a renamed or new mode. Use the
+        // `list_modes` action for a real answer; this stays as a cheap hint.
         const N = ['deep research', 'canvas', 'create image', 'create video', 'create music', 'guided learning'];
         const modes = [...document.querySelectorAll('button')].filter(x =>
           x.offsetParent !== null && x.querySelector('mat-icon') &&
           N.indexOf((x.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()) >= 0
         ).map(x => (x.textContent || '').replace(/\s+/g, ' ').trim());
-        return { model, modes };
+        // Label the provenance so an empty array cannot be read as "no modes exist".
+        return { model, modes, modesSource: 'composer-quick-pills', modesComplete: false };
       }
     });
     const s = r && r[0] && r[0].result;
@@ -184,6 +668,13 @@ async function handleCommand(topic, command) {
   await broadcastLog('cmd', command);
 
   let result;
+  // Declared HERE, not inside the try, because the response object below reads
+  // `tab` AFTER the catch. With `let tab` inside the try it is out of scope at
+  // that point, so building the response threw ReferenceError and the publish on
+  // the next line never ran — every command did its work and then answered
+  // nothing. Proven 2026-08-31 by the extension logging each received command
+  // while no response was ever published.
+  let tab;
 
   try {
     // === TAB MANAGEMENT ACTIONS (don't require existing Gemini tab) ===
@@ -494,7 +985,6 @@ Use double newlines between timestamps!`;
     }
 
     // === RESOLVE TARGET TAB ===
-    let tab;
     if (command.tabId) {
       // Use specific tab if provided - simple and direct
       tab = await chrome.tabs.get(command.tabId);
@@ -821,10 +1311,52 @@ Use double newlines between timestamps!`;
         }
         break;
 
-      case 'screenshot':
-        const dataUrl = await chrome.tabs.captureVisibleTab();
-        result = { screenshot: dataUrl };
+      case 'screenshot': {
+        // Why this needs a permission at all, measured 2026-09-01 in an isolated
+        // browser rather than inferred from the error string:
+        //   host_permissions gemini only, active tab ON gemini -> FAILED
+        //     "Either the '<all_urls>' or 'activeTab' permission is required."
+        //   same, plus <all_urls>                              -> OK, 68091 chars
+        // So a host permission for the exact site is NOT enough - it is a static
+        // check. `activeTab` would also satisfy it, but that is granted only by a
+        // real user gesture, and a command arriving over MQTT has none. Hence
+        // <all_urls>, and hence it being OPTIONAL: the user grants it with one click
+        // on the side panel's Screenshot button and can revoke it any time in
+        // chrome://extensions. It is not claimed at install.
+        // Attempt the capture and let it be the test. `permissions.contains`
+        // is NOT a reliable pre-check: Chrome's per-extension "Site access"
+        // control can WITHHOLD a granted host permission, and in that state
+        // contains() still answers true while captureVisibleTab fails with
+        //   "The 'activeTab' permission is not in effect because this extension
+        //    has not been invoked."
+        // Measured 2026-09-01, after two captures had already succeeded. A check
+        // that passes while the operation fails is worse than no check.
+        let shot;
+        try {
+          // format:'png' explicitly. The default is JPEG, and chrome.downloads then
+          // corrects the extension to match the real mime type - so the response
+          // announced "screenshot-<ts>.png" while the file on disk was .jpg. PNG is
+          // also the right format for reading UI text, which is what these are for.
+          shot = await chrome.tabs.captureVisibleTab({ format: 'png' });
+        } catch (e) {
+          const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] })
+            .catch(() => null);
+          result = {
+            success: false,
+            error: String(e.message || e),
+            allUrlsGranted: granted,
+            fix: granted
+              ? 'the permission is granted but WITHHELD: chrome://extensions -> Gemini Proxy -> Site access -> On all sites'
+              : 'click Screenshot once in the extension side panel to grant all-site access',
+          };
+          break;
+        }
+
+        const filename = `gemini-proxy/screenshot-${Date.now()}.png`;
+        const shotId = await chrome.downloads.download({ url: shot, filename });
+        result = { success: true, filename, downloadId: shotId, bytes: shot.length };
         break;
+      }
 
       case 'download':
         const dlId = await chrome.downloads.download({
@@ -833,6 +1365,40 @@ Use double newlines between timestamps!`;
         });
         result = { downloadId: dlId };
         break;
+
+      case 'describe': {
+        // Selector -> what each matching element actually IS: its label, role and
+        // visibility. Reconnaissance only, no clicks, no state change.
+        //
+        // This exists because the two ways to ask that question are both dead on
+        // gemini.google.com: `execute` runs eval() and the page CSP forbids it
+        // ("'unsafe-eval' is not an allowed source of script"), and `get_html`
+        // truncates at 50000 characters, which on this page ends inside <head>
+        // before any composer markup. The composer's mode pills are icon-only, so
+        // their names live in aria-label and nowhere in innerText.
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: (sel, max) => {
+            const els = Array.from(document.querySelectorAll(sel));
+            return {
+              total: els.length,
+              elements: els.slice(0, max).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                label: el.getAttribute('aria-label'),
+                text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+                role: el.getAttribute('role'),
+                testId: el.getAttribute('data-test-id'),
+                checked: el.getAttribute('aria-checked'),
+                haspopup: el.getAttribute('aria-haspopup'),
+                visible: el.offsetParent !== null
+              }))
+            };
+          },
+          args: [command.selector, command.max || 40]
+        });
+        result = result[0]?.result;
+        break;
+      }
 
       case 'execute':
         result = await chrome.scripting.executeScript({
@@ -852,161 +1418,111 @@ Use double newlines between timestamps!`;
       case 'select_model':
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: async (modelName) => {
-            const allBtns = Array.from(document.querySelectorAll('button'));
-            const debug = { totalButtons: allBtns.length, candidates: [] };
-
-            let dropdownBtn = null;
-            // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
-            dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
-            if (dropdownBtn) debug.foundBy = 'bard-mode-menu-button-testid';
-
-            // FALLBACK: legacy class (button.input-area-switch is the same element today, kept for A/B)
-            if (!dropdownBtn) {
-              dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
-              if (dropdownBtn) debug.foundBy = 'input-area-switch';
-            }
-
-            if (!dropdownBtn) {
-              dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
-              if (dropdownBtn) debug.foundBy = 'text-match';
-            }
-
-            if (!dropdownBtn) {
-              dropdownBtn = allBtns.find(b => b.parentElement?.className?.includes('pill-ui'));
-              if (dropdownBtn) debug.foundBy = 'pill-ui-parent';
-            }
-
-            if (!dropdownBtn) {
-              return { error: 'Model dropdown not found', debug, request: modelName };
-            }
-
-            debug.clickedButton = { class: dropdownBtn.className.substring(0, 50), text: dropdownBtn.textContent.trim() };
-            dropdownBtn.click();
-            await new Promise(r => setTimeout(r, 600));
-
-            const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
-            const targetModel = modelMap[modelName.toLowerCase()] || modelName;
-
-            // Current Gemini model menu (verified live 2026-08): role="menuitem" items titled
-            // "3.5 Flash-Lite", "3.6 Flash", "3.1 Pro", "Extended thinking", each with a second
-            // description line. Match the TITLE (first line) not the whole textContent, else
-            // 'pro' would also hit "Complex problem solving" under Extended thinking. Case-
-            // insensitive because Gemini re-cases labels (e.g. "Extended thinking").
-            const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="listbox"] button, .mat-mdc-menu-item');
-            const wantLc = targetModel.toLowerCase();
-            const titleOf = (el) => ((el.textContent || '').trim().split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
-            let chosen = [...options].find(o => titleOf(o).toLowerCase().includes(wantLc));
-            if (!chosen) chosen = [...options].find(o => (o.textContent || '').toLowerCase().includes(wantLc));
-            if (chosen) {
-              chosen.click();
-              return { success: true, model: targetModel, debug, request: modelName };
-            }
-
-            const allClickables = document.querySelectorAll('button, div[role="option"], .mdc-list-item');
-            for (const el of allClickables) {
-              if (el.textContent.trim().startsWith(targetModel) && el !== dropdownBtn) {
-                el.click();
-                return { success: true, model: targetModel, debug, request: modelName };
-              }
-            }
-
-            return { error: 'Model option not found: ' + targetModel, debug, request: modelName };
-          },
+          func: selectModelInPage,
           args: [command.model || 'pro']
         });
         result = result[0]?.result;
         break;
 
-      case 'select_mode':
-        // Select Gemini mode (Deep Research, Canvas, etc)
-        // Uses menuitemcheckbox with aria-checked to detect active state
+      case 'reload_tab': {
+        // Exists so the lazy-render path can be TESTED. The Tools menu's content
+        // is lazily loaded and only the FIRST open after a page load renders the
+        // empty shell, so a suite run against an already-warm menu passes while
+        // that bug is present. Without a reload there is no way to reach the cold
+        // state from the CLI.
+        await chrome.tabs.reload(tab.id);
+        const deadline = Date.now() + 45000;
+        let loaded = false, composerReady = false;
+        while (Date.now() < deadline && !loaded) {
+          await new Promise(r => setTimeout(r, 500));
+          const t = await chrome.tabs.get(tab.id);
+          if (t.status === 'complete') loaded = true;
+        }
+        // "complete" is the document, not the app. Wait for the Tools button too,
+        // or the next command races a half-rendered SPA.
+        while (Date.now() < deadline && !composerReady) {
+          try {
+            const probe = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: () => !!(document.querySelector('button[aria-label="Upload & tools"]') ||
+                             document.querySelector('button[aria-label*="tools" i]'))
+            });
+            composerReady = !!probe[0]?.result;
+          } catch (e) { /* page still swapping documents */ }
+          if (!composerReady) await new Promise(r => setTimeout(r, 500));
+        }
+        result = {
+          success: loaded && composerReady,
+          loaded, composerReady,
+          ...(loaded && composerReady ? {} : { error: 'tab reloaded but the composer never appeared' })
+        };
+        break;
+      }
+
+      case 'reload_extension': {
+        // Reload the extension from disk, from the CLI, with no human at the
+        // keyboard. Chrome loads this extension unpacked, so a code change on
+        // disk needs the extension reloaded before it runs - and until now that
+        // meant a human clicking reload in chrome://extensions, about eight
+        // times in a single session. That is the root cause of the reload
+        // dance, not a nuisance around it.
+        //
+        // Safe because nothing here depends on a surviving content script:
+        // every command reaches the page through chrome.scripting.executeScript
+        // (36 call sites; zero chrome.tabs.sendMessage), which injects fresh
+        // code each time. The injected TAB badge and buttons do disappear until
+        // the tab is reloaded - `reload_tab` is there for that, and nothing
+        // else needs it.
+        //
+        // The delay is not decoration: chrome.runtime.reload() tears down this
+        // worker, so the response has to be on the socket before it fires.
+        // Nothing can publish afterwards.
+        result = { success: true, reloading: true, version: VERSION };
+        setTimeout(() => chrome.runtime.reload(), 750);
+        break;
+      }
+
+      case 'list_modes':
+      case 'dump_menu': {
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: async (modeName) => {
-            const debug = {};
-            const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
-
-            // Step 1: Open Tools menu
-            let toolsBtn = findTools();
-            if (!toolsBtn) return { error: 'Tools button not found' };
-
-            toolsBtn.click();
-            await new Promise(r => setTimeout(r, 800));
-
-            // Step 2: Check if target is already active (toggle off) or deselect other mode
-            const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
-            for (const item of menuItems) {
-              if (item.getAttribute('aria-checked') === 'true') {
-                const checkedName = item.textContent?.trim().split('\n')[0]?.trim();
-                debug.deselected = checkedName;
-                item.click();
-                await new Promise(r => setTimeout(r, 1000));
-
-                // If toggling off the same mode, we're done
-                if (checkedName?.toLowerCase() === modeName?.toLowerCase()) {
-                  console.log('[Claude Proxy] Toggled off mode:', modeName);
-                  return { success: true, mode: modeName, toggled: 'off', debug };
-                }
-
-                // Otherwise, re-open Tools to select the new mode
-                await new Promise(r => setTimeout(r, 500));
-                toolsBtn = findTools();
-                if (!toolsBtn) return { error: 'Tools button not found after deselect', debug };
-                toolsBtn.click();
-                await new Promise(r => setTimeout(r, 1000));
-                break;
-              }
-            }
-
-            // Step 3: Find and click the target mode by matching first line of text
-            const items = document.querySelectorAll('[role="menuitemcheckbox"]');
-            debug.menuItems = Array.from(items).map(i => i.textContent?.trim().split('\n')[0]?.trim());
-            for (const item of items) {
-              const text = item.textContent?.trim();
-              const firstLine = text?.split('\n')[0]?.trim();
-              if (firstLine?.toLowerCase() === modeName?.toLowerCase()) {
-                item.click();
-                debug.clicked = { tag: item.tagName, text: text.substring(0, 50) };
-                console.log('[Claude Proxy] Selected mode:', modeName);
-                return { success: true, mode: modeName, debug };
-              }
-            }
-
-            return { error: modeName + ' not found in menu', debug };
-          },
-          args: [command.mode || 'Deep Research']
+          func: menuOpInPage,
+          args: [command.action === 'dump_menu' ? 'dump' : 'list']
         });
         result = result[0]?.result;
         break;
+      }
 
-      case 'get_response':
-        // Get Gemini responses (same as sidebar button)
-        if (!tab.url?.includes('gemini.google.com')) {
-          result = { error: 'Not on Gemini page' };
+      case 'upload_file': {
+        if (!command.filename) { result = { error: 'upload_file requires "filename"' }; break; }
+        if (!command.contentBase64) { result = { error: 'upload_file requires "contentBase64"' }; break; }
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
+        // Reject oversize before shipping the string into the page.
+        const approxBytes = Math.floor(command.contentBase64.length * 3 / 4);
+        if (approxBytes > MAX_UPLOAD_BYTES) {
+          result = { error: 'file is about ' + approxBytes + ' bytes, over the ' + MAX_UPLOAD_BYTES + ' byte limit' };
           break;
         }
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: () => {
-            const all = document.querySelectorAll('MESSAGE-CONTENT, message-content');
-            if (all.length === 0) return { error: 'No responses found' };
-            // Get latest response (last one)
-            const latest = all[all.length - 1];
-            const answer = (latest.innerText || '').trim();
-            return {
-              answer: answer,
-              count: all.length,
-              timestamp: Date.now()
-            };
-          }
+          func: menuOpInPage,
+          args: ['upload', { filename: command.filename, mimeType: command.mimeType || '', b64: command.contentBase64 }]
         });
         result = result[0]?.result;
-        // Also publish to answer topic for convenience
-        if (result && result.answer) {
-          publish(TOPICS.answer, result, true);
-        }
         break;
+      }
+
+      case 'select_mode': {
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
+        result = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: menuOpInPage,
+          args: ['select', command.mode || 'Deep research']
+        });
+        result = result[0]?.result;
+        break;
+      }
 
       case 'chat':
         // SMOOTH: Fast chat - direct text insert + Enter
@@ -1409,44 +1925,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     chrome.scripting.executeScript({
       target: { tabId },
-      func: async (modelName) => {
-        const allBtns = Array.from(document.querySelectorAll('button'));
-        // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
-        let dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
-        // FALLBACK: legacy class / text / pill parent (kept for A/B; same element today)
-        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
-        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
-        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.parentElement?.className?.includes('pill-ui'));
-        if (!dropdownBtn) return { error: 'Model dropdown not found' };
-
-        dropdownBtn.click();
-        await new Promise(r => setTimeout(r, 600));
-
-        const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
-        const targetModel = modelMap[modelName.toLowerCase()] || modelName;
-
-        // Look for clickable elements in the dropdown
-        const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="listbox"] button, .mdc-list-item, [class*="option"]');
-        for (const opt of options) {
-          const text = opt.textContent?.trim();
-          // Match if text starts with model name or first line matches
-          if (text?.startsWith(targetModel) || text?.split('\n')[0]?.trim() === targetModel) {
-            opt.click();
-            return { success: true, model: targetModel };
-          }
-        }
-
-        // Fallback: find any clickable with exact model name at start
-        const allClickables = document.querySelectorAll('button, div[role="option"], div[tabindex], [class*="list-item"]');
-        for (const el of allClickables) {
-          const text = el.textContent?.trim();
-          if (text?.startsWith(targetModel) && el !== dropdownBtn) {
-            el.click();
-            return { success: true, model: targetModel };
-          }
-        }
-        return { error: 'Model option not found: ' + targetModel };
-      },
+      func: selectModelInPage,
       args: [msg.model || 'pro']
     }).then(results => {
       sendResponse(results[0]?.result || { error: 'Script failed' });
@@ -1454,6 +1933,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ error: e.message });
     });
     return true; // Keep channel open for async response
+  } else if (msg.action === 'deselect_active_mode') {
+    // The side panel's New Chat button used to carry its own copy of this: click
+    // Tools, sleep 800ms, walk [role=menuitemcheckbox]. That is the lazy-render
+    // bug fixed everywhere else, so on a cold menu it silently cleared nothing.
+    // It now goes through the one shared helper like every other menu action.
+    const tabId = sender.tab?.id;
+    const run = tabId
+      ? Promise.resolve(tabId)
+      : chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => ts[0]?.id);
+    run.then(id => {
+      if (!id) { sendResponse({ error: 'No Gemini tab' }); return; }
+      return chrome.scripting.executeScript({
+        target: { tabId: id },
+        func: menuOpInPage,
+        args: ['deselect-active', null]
+      }).then(r => sendResponse(r[0]?.result || { error: 'Script failed' }));
+    }).catch(e => sendResponse({ error: e.message }));
+    return true;
   } else if (msg.action === 'select_mode') {
     // Mode selection from content script (Deep Research, etc)
     const tabId = sender.tab?.id;
@@ -1463,58 +1960,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     chrome.scripting.executeScript({
       target: { tabId },
-      func: async (modeName) => {
-        const debug = {};
-        const findTools = () => document.querySelector('button[aria-label="Upload & tools"]') || document.querySelector('button[aria-label*="tools" i]') || Array.from(document.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Tools');
-
-        // Step 1: Open Tools menu
-        let toolsBtn = findTools();
-        if (!toolsBtn) return { error: 'Tools button not found' };
-
-        toolsBtn.click();
-        await new Promise(r => setTimeout(r, 800));
-
-        // Step 2: Check if target is already active (toggle off) or deselect other mode
-        const menuItems = document.querySelectorAll('[role="menuitemcheckbox"]');
-        for (const item of menuItems) {
-          if (item.getAttribute('aria-checked') === 'true') {
-            const checkedName = item.textContent?.trim().split('\n')[0]?.trim();
-            debug.deselected = checkedName;
-            item.click();
-            await new Promise(r => setTimeout(r, 1000));
-
-            // If toggling off the same mode, we're done
-            if (checkedName?.toLowerCase() === modeName?.toLowerCase()) {
-              return { success: true, mode: modeName, toggled: 'off', debug };
-            }
-
-            // Otherwise, re-open Tools to select the new mode
-            // Wait for DOM to settle after deselection
-            await new Promise(r => setTimeout(r, 500));
-            toolsBtn = findTools();
-            if (!toolsBtn) return { error: 'Tools button not found after deselect', debug };
-            toolsBtn.click();
-            await new Promise(r => setTimeout(r, 1000));
-            break;
-          }
-        }
-
-        // Step 3: Click target mode by matching first line of text
-        const items = document.querySelectorAll('[role="menuitemcheckbox"]');
-        debug.menuItems = Array.from(items).map(i => i.textContent?.trim().split('\n')[0]?.trim());
-        for (const item of items) {
-          const text = item.textContent?.trim();
-          const firstLine = text?.split('\n')[0]?.trim();
-          if (firstLine?.toLowerCase() === modeName?.toLowerCase()) {
-            item.click();
-            debug.clicked = { tag: item.tagName, text: text?.substring(0, 50) };
-            return { success: true, mode: modeName, debug };
-          }
-        }
-
-        return { error: modeName + ' not found in menu', debug };
-      },
-      args: [msg.mode || 'Deep Research']
+      func: menuOpInPage,
+      args: ['select', msg.mode || 'Deep research']
     }).then(results => {
       sendResponse(results[0]?.result || { error: 'Script failed' });
     }).catch(e => {
@@ -1627,9 +2074,14 @@ try {
       try { connect(); } catch (e) { console.error('[MQTT] keepalive reconnect failed', e); }
     } else {
       try {
-        client.publish(TOPICS.status, JSON.stringify({
-          status: 'online', timestamp: Date.now(), version: VERSION, keepalive: true
-        }), { retain: true });
+        // Connected but not subscribed is the exact state that made the bridge
+        // look healthy while silently dropping every command. Repair it here
+        // rather than waiting for a reconnect that may never come.
+        if (!isSubscribed) {
+          console.warn('[MQTT] keepalive: connected but NOT subscribed — resubscribing');
+          subscribeToCommands();
+        }
+        publishStatus({ keepalive: true });
         // refresh retained mode state while we're awake
         chrome.tabs.query({ url: 'https://gemini.google.com/*' }).then(ts => {
           const t = ts.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
@@ -1670,13 +2122,23 @@ async function publishCurrentPage() {
 async function updateSidebarState() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const onGemini = tab?.url?.includes('gemini.google.com');
+    // There may be no active tab at all — between closing the last tab in a
+    // window, or while a window is losing focus. The line below used to read
+    // `tab?.url` and then `tab.id`, guarding the same object twice and then
+    // once not, so it threw exactly then. The empty catch swallowed it, which
+    // is why nothing ever reported a side panel that had quietly stopped
+    // updating.
+    if (!tab) return;
     await chrome.sidePanel.setOptions({
       tabId: tab.id,
       path: 'sidepanel.html',
-      enabled: onGemini
+      enabled: !!tab.url?.includes('gemini.google.com')
     });
-  } catch (e) {}
+  } catch (e) {
+    // Still non-fatal — a side panel that cannot be configured must not break
+    // tab switching — but no longer invisible.
+    console.warn('[Sidebar] setOptions failed:', e?.message || e);
+  }
 }
 
 // Listen for tab changes

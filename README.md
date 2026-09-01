@@ -55,7 +55,7 @@ Claude Code CLI  <-->  MQTT Broker (Mosquitto)  <-->  Chrome Extension  <-->  Br
 ### Gemini AI Integration | ใช้งาน Gemini
 - `chat` - Send message to Gemini
 - `select_model` - Switch Gemini model (Fast/Thinking/Pro)
-- `select_mode` - Switch to Deep Research mode
+- `select_mode` - Toggle any Tools-menu mode (Deep research, Canvas, Create image/video/music, Guided learning)
 - `wait_response` - Wait for Gemini response
 - `transcribe` - Transcribe YouTube video via Gemini
 
@@ -259,7 +259,11 @@ tab when several are open.
 |--------|-------------|------------|
 | `chat` | Send to Gemini | `text` |
 | `select_model` | Switch model | `model` (fast/thinking/pro) |
-| `select_mode` | Switch mode | `mode` (`Deep Research` / `Canvas`) |
+| `select_mode` | Toggle a Tools-menu mode on or off | `mode` — one of `Create image`, `Create video`, `Create music`, `Canvas`, `Deep research`, `Guided learning` (matched case-insensitively) |
+| `list_modes` | Enumerate the Tools menu | - |
+| `dump_menu` | As `list_modes`, plus raw menu HTML | - |
+| `upload_file` | Attach a file to the composer | `filename`, `contentBase64`, `mimeType` (optional) |
+| `reload_tab` | Reload the Gemini tab and wait for the composer | - |
 | `wait_response` | Wait for response | `timeout` (ms, default 15000) |
 | `transcribe` | Transcribe YouTube | `url`, `prompt` (optional) |
 
@@ -269,7 +273,8 @@ tab when several are open.
 |--------|-------------|------------|
 | `screenshot` | Capture tab | - |
 | `download` | Download file | `url`, `filename` (optional) |
-| `execute` | Run JavaScript | `code` |
+| `describe` | Report what elements a selector matches (label, role, state) | `selector`, `max` (default 40) |
+| `execute` | Run JavaScript — **broken on gemini.google.com**, the page CSP forbids `eval` | `code` |
 
 ### Tab Targeting
 
