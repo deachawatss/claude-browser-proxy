@@ -161,7 +161,18 @@ if [ "$SKIP_UPLOAD" -eq 0 ]; then
   CO_CHIP=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 45)
   check "attachment survives the mode change" "$CO_CHIP" '"found":true'
   send '{"action":"select_mode","mode":"Canvas"}' 90 > /dev/null            # mode off
-  send '{"action":"click","selector":"button[aria-label^=\"close\" i]"}' 45 > /dev/null  # chip off
+
+  # Teardown is a CHECK, not a fire-and-forget click. It used to be
+  #   send '{"action":"click",...}' 45 > /dev/null
+  # and on 2026-09-01 it silently did nothing: the fixture stayed attached, so the
+  # next ordinary chat on that tab inherited it and answered
+  #   "harness-ok[source: 1]coexist fixture"
+  # A suite that dirties the browser and does not verify its own cleanup hands the
+  # mess to whoever runs next, and looks green doing it. Issue #17.
+  PLANNED=$((PLANNED + 1))
+  send '{"action":"click","selector":"button[aria-label^=\"close\" i]"}' 45 > /dev/null
+  CO_GONE=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 45)
+  check "the attachment is actually removed at the end" "$CO_GONE" '"found":false'
 fi
 
 echo
