@@ -86,6 +86,17 @@ STATUS=$(timeout 20 mosquitto_sub -h "$HOST" -t claude/browser/status -C 1 -W 10
 check "extension is online" "$STATUS" '"subscribed":true'
 echo "  version: $(printf '%s' "$STATUS" | grep -o '"version":"[^"]*"')"
 
+# Chrome throttles rendering in an unfocused window, so Gemini's Tools menu never
+# finishes opening there and every menu check below times out with an EMPTY
+# response - which reads as a dead bridge, not as a focus problem. That happened
+# on 2026-09-01: 20+ checks failed while get_url answered in milliseconds.
+# Focus the tab deliberately instead of hoping it happens to be in front.
+echo "== focus =="
+PLANNED=$((PLANNED + 1))
+TABID=$(printf '%s' "$(send '{"action":"list_tabs"}' 30)" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+FOCUS=$(send "{\"action\":\"focus_tab\",\"tabId\":${TABID:-0}}" 30)
+check "the Gemini tab is focused (menus will not render otherwise)" "$FOCUS" '"success":true'
+
 echo "== list_modes =="
 MODES=$(send '{"action":"list_modes"}' 45)
 PLANNED=$((PLANNED + 2))
@@ -161,7 +172,27 @@ if [ "$SKIP_UPLOAD" -eq 0 ]; then
   CO_CHIP=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 45)
   check "attachment survives the mode change" "$CO_CHIP" '"found":true'
   send '{"action":"select_mode","mode":"Canvas"}' 90 > /dev/null            # mode off
-  send '{"action":"click","selector":"button[aria-label^=\"close\" i]"}' 45 > /dev/null  # chip off
+
+  # Teardown is a CHECK, not a fire-and-forget click. It used to be
+  #   send '{"action":"click",...}' 45 > /dev/null
+  # and on 2026-09-01 it silently did nothing: the fixture stayed attached, so the
+  # next ordinary chat on that tab inherited it and answered
+  #   "harness-ok[source: 1]coexist fixture"
+  # A suite that dirties the browser and does not verify its own cleanup hands the
+  # mess to whoever runs next, and looks green doing it. Issue #17.
+  # A run attaches TWO files - the upload_file fixture and the coexist fixture -
+  # and the old teardown clicked close exactly once, so one always survived. That
+  # is the leftover that ended up in the next chat's answer. Close until none are
+  # left, then prove it.
+  PLANNED=$((PLANNED + 1))
+  for _ in 1 2 3 4 5; do
+    CHIPS=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 30)
+    printf '%s' "$CHIPS" | grep -qF '"found":false' && break
+    send '{"action":"click","selector":"button[aria-label^=\"close\" i]"}' 30 > /dev/null
+    sleep 1
+  done
+  CO_GONE=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 45)
+  check "every attachment is actually removed at the end" "$CO_GONE" '"found":false'
 fi
 
 echo

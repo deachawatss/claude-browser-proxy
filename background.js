@@ -101,6 +101,108 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 // the active mode" step failed silently on a cold menu.
 //
 // op is one of: 'list' | 'select' | 'upload' | 'deselect-active'
+// Chrome throttles rendering in a window that is not focused, and Gemini's Tools
+// menu is an overlay that never finishes opening there. Every menuOpInPage caller
+// then waits out its own timeout and answers nothing, which is indistinguishable
+// from a dead bridge.
+//
+// That is not hypothetical: on 2026-09-01 it failed 20+ checks of
+// verify-menu-actions.sh with EMPTY responses while `get_url` answered in
+// milliseconds and the status topic said subscribed:true. The diagnosis cost an
+// hour and two wrong theories (output buffering, then a refactor that turned out
+// to be byte-identical to main). `focus_tab` fixed it in one command.
+//
+// So: say so in one second instead of hanging for ninety. Deliberately NOT
+// auto-focusing - stealing the window from under Wind is the "why you stucking in
+// loop?" failure of 2026-08-31. The caller is told exactly which command fixes it.
+async function menuBlockedByUnfocusedWindow(tab) {
+  let win;
+  try {
+    win = await chrome.windows.get(tab.windowId);
+  } catch (e) {
+    return null; // cannot tell - proceed rather than block on a guess
+  }
+  if (win.focused) return null;
+  return {
+    success: false,
+    error: 'the browser window holding the Gemini tab is not focused, so its Tools menu will not render',
+    fix: `send {"action":"focus_tab","tabId":${tab.id}} first, or click that window`,
+    windowId: tab.windowId,
+  };
+}
+
+// ONE page-side implementation of model selection, for the same reason
+// menuOpInPage exists: an injected function cannot close over module scope, so the
+// only way to share it is for both callers to inject the same function.
+//
+// There were two copies before this - the MQTT `select_model` case and the
+// runtime-message handler the on-page buttons use - and they had already drifted.
+// This copy matches the menu item's TITLE line, because "pro" otherwise also hits
+// "Complex problem solving" under Extended thinking; the content-script copy still
+// used a loose startsWith and would pick the wrong model. Issue #18.
+async function selectModelInPage(modelName) {
+  const allBtns = Array.from(document.querySelectorAll('button'));
+  const debug = { totalButtons: allBtns.length, candidates: [] };
+
+  let dropdownBtn = null;
+  // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
+  dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
+  if (dropdownBtn) debug.foundBy = 'bard-mode-menu-button-testid';
+
+  // FALLBACK: legacy class (button.input-area-switch is the same element today, kept for A/B)
+  if (!dropdownBtn) {
+    dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
+    if (dropdownBtn) debug.foundBy = 'input-area-switch';
+  }
+
+  if (!dropdownBtn) {
+    dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
+    if (dropdownBtn) debug.foundBy = 'text-match';
+  }
+
+  if (!dropdownBtn) {
+    dropdownBtn = allBtns.find(b => b.parentElement?.className?.includes('pill-ui'));
+    if (dropdownBtn) debug.foundBy = 'pill-ui-parent';
+  }
+
+  if (!dropdownBtn) {
+    return { error: 'Model dropdown not found', debug, request: modelName };
+  }
+
+  debug.clickedButton = { class: dropdownBtn.className.substring(0, 50), text: dropdownBtn.textContent.trim() };
+  dropdownBtn.click();
+  await new Promise(r => setTimeout(r, 600));
+
+  const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
+  const targetModel = modelMap[modelName.toLowerCase()] || modelName;
+
+  // Current Gemini model menu (verified live 2026-08): role="menuitem" items titled
+  // "3.5 Flash-Lite", "3.6 Flash", "3.1 Pro", "Extended thinking", each with a second
+  // description line. Match the TITLE (first line) not the whole textContent, else
+  // 'pro' would also hit "Complex problem solving" under Extended thinking. Case-
+  // insensitive because Gemini re-cases labels (e.g. "Extended thinking").
+  const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="listbox"] button, .mat-mdc-menu-item');
+  const wantLc = targetModel.toLowerCase();
+  const titleOf = (el) => ((el.textContent || '').trim().split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
+  let chosen = [...options].find(o => titleOf(o).toLowerCase().includes(wantLc));
+  if (!chosen) chosen = [...options].find(o => (o.textContent || '').toLowerCase().includes(wantLc));
+  if (chosen) {
+    chosen.click();
+    return { success: true, model: targetModel, debug, request: modelName };
+  }
+
+  const allClickables = document.querySelectorAll('button, div[role="option"], .mdc-list-item');
+  for (const el of allClickables) {
+    if (el.textContent.trim().startsWith(targetModel) && el !== dropdownBtn) {
+      el.click();
+      return { success: true, model: targetModel, debug, request: modelName };
+    }
+  }
+
+  return { error: 'Model option not found: ' + targetModel, debug, request: modelName };
+}
+
+
 async function menuOpInPage(op, arg) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const debug = { op, attempts: [] };
@@ -1209,10 +1311,37 @@ Use double newlines between timestamps!`;
         }
         break;
 
-      case 'screenshot':
-        const dataUrl = await chrome.tabs.captureVisibleTab();
-        result = { screenshot: dataUrl };
+      case 'screenshot': {
+        // Why this needs a permission at all, measured 2026-09-01 in an isolated
+        // browser rather than inferred from the error string:
+        //   host_permissions gemini only, active tab ON gemini -> FAILED
+        //     "Either the '<all_urls>' or 'activeTab' permission is required."
+        //   same, plus <all_urls>                              -> OK, 68091 chars
+        // So a host permission for the exact site is NOT enough - it is a static
+        // check. `activeTab` would also satisfy it, but that is granted only by a
+        // real user gesture, and a command arriving over MQTT has none. Hence
+        // <all_urls>, and hence it being OPTIONAL: Wind grants it with one click
+        // on the side panel's Screenshot button and can revoke it any time in
+        // chrome://extensions. It is not claimed at install.
+        const allowed = await chrome.permissions.contains({ origins: ['<all_urls>'] });
+        if (!allowed) {
+          result = {
+            success: false,
+            error: 'all-site access is not granted, so the tab cannot be captured',
+            fix: 'click Screenshot once in the extension side panel to grant it; revoke any time in chrome://extensions',
+          };
+          break;
+        }
+
+        const shot = await chrome.tabs.captureVisibleTab();
+        // Saved as a file rather than published: a PNG data URL is ~68KB of
+        // base64, and the point is for the caller to LOOK at it, which means it
+        // has to become a file somewhere anyway.
+        const filename = `gemini-proxy/screenshot-${Date.now()}.png`;
+        const shotId = await chrome.downloads.download({ url: shot, filename });
+        result = { success: true, filename, downloadId: shotId, bytes: shot.length };
         break;
+      }
 
       case 'download':
         const dlId = await chrome.downloads.download({
@@ -1274,67 +1403,7 @@ Use double newlines between timestamps!`;
       case 'select_model':
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: async (modelName) => {
-            const allBtns = Array.from(document.querySelectorAll('button'));
-            const debug = { totalButtons: allBtns.length, candidates: [] };
-
-            let dropdownBtn = null;
-            // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
-            dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
-            if (dropdownBtn) debug.foundBy = 'bard-mode-menu-button-testid';
-
-            // FALLBACK: legacy class (button.input-area-switch is the same element today, kept for A/B)
-            if (!dropdownBtn) {
-              dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
-              if (dropdownBtn) debug.foundBy = 'input-area-switch';
-            }
-
-            if (!dropdownBtn) {
-              dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
-              if (dropdownBtn) debug.foundBy = 'text-match';
-            }
-
-            if (!dropdownBtn) {
-              dropdownBtn = allBtns.find(b => b.parentElement?.className?.includes('pill-ui'));
-              if (dropdownBtn) debug.foundBy = 'pill-ui-parent';
-            }
-
-            if (!dropdownBtn) {
-              return { error: 'Model dropdown not found', debug, request: modelName };
-            }
-
-            debug.clickedButton = { class: dropdownBtn.className.substring(0, 50), text: dropdownBtn.textContent.trim() };
-            dropdownBtn.click();
-            await new Promise(r => setTimeout(r, 600));
-
-            const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
-            const targetModel = modelMap[modelName.toLowerCase()] || modelName;
-
-            // Current Gemini model menu (verified live 2026-08): role="menuitem" items titled
-            // "3.5 Flash-Lite", "3.6 Flash", "3.1 Pro", "Extended thinking", each with a second
-            // description line. Match the TITLE (first line) not the whole textContent, else
-            // 'pro' would also hit "Complex problem solving" under Extended thinking. Case-
-            // insensitive because Gemini re-cases labels (e.g. "Extended thinking").
-            const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="listbox"] button, .mat-mdc-menu-item');
-            const wantLc = targetModel.toLowerCase();
-            const titleOf = (el) => ((el.textContent || '').trim().split('\n').map(s => s.trim()).filter(Boolean)[0] || '');
-            let chosen = [...options].find(o => titleOf(o).toLowerCase().includes(wantLc));
-            if (!chosen) chosen = [...options].find(o => (o.textContent || '').toLowerCase().includes(wantLc));
-            if (chosen) {
-              chosen.click();
-              return { success: true, model: targetModel, debug, request: modelName };
-            }
-
-            const allClickables = document.querySelectorAll('button, div[role="option"], .mdc-list-item');
-            for (const el of allClickables) {
-              if (el.textContent.trim().startsWith(targetModel) && el !== dropdownBtn) {
-                el.click();
-                return { success: true, model: targetModel, debug, request: modelName };
-              }
-            }
-
-            return { error: 'Model option not found: ' + targetModel, debug, request: modelName };
-          },
+          func: selectModelInPage,
           args: [command.model || 'pro']
         });
         result = result[0]?.result;
@@ -1400,6 +1469,7 @@ Use double newlines between timestamps!`;
 
       case 'list_modes':
       case 'dump_menu': {
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: menuOpInPage,
@@ -1412,6 +1482,7 @@ Use double newlines between timestamps!`;
       case 'upload_file': {
         if (!command.filename) { result = { error: 'upload_file requires "filename"' }; break; }
         if (!command.contentBase64) { result = { error: 'upload_file requires "contentBase64"' }; break; }
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
         // Reject oversize before shipping the string into the page.
         const approxBytes = Math.floor(command.contentBase64.length * 3 / 4);
         if (approxBytes > MAX_UPLOAD_BYTES) {
@@ -1427,7 +1498,8 @@ Use double newlines between timestamps!`;
         break;
       }
 
-      case 'select_mode':
+      case 'select_mode': {
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: menuOpInPage,
@@ -1435,6 +1507,7 @@ Use double newlines between timestamps!`;
         });
         result = result[0]?.result;
         break;
+      }
 
       case 'chat':
         // SMOOTH: Fast chat - direct text insert + Enter
@@ -1837,44 +1910,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     chrome.scripting.executeScript({
       target: { tabId },
-      func: async (modelName) => {
-        const allBtns = Array.from(document.querySelectorAll('button'));
-        // PRIMARY (current Gemini UI 2026-08): stable test-id on the mode picker button
-        let dropdownBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
-        // FALLBACK: legacy class / text / pill parent (kept for A/B; same element today)
-        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.className.includes('input-area-switch'));
-        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.textContent.trim().match(/^(Pro|Fast|Thinking)$/i));
-        if (!dropdownBtn) dropdownBtn = allBtns.find(b => b.parentElement?.className?.includes('pill-ui'));
-        if (!dropdownBtn) return { error: 'Model dropdown not found' };
-
-        dropdownBtn.click();
-        await new Promise(r => setTimeout(r, 600));
-
-        const modelMap = { 'fast': 'Fast', 'thinking': 'Thinking', 'pro': 'Pro' };
-        const targetModel = modelMap[modelName.toLowerCase()] || modelName;
-
-        // Look for clickable elements in the dropdown
-        const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="listbox"] button, .mdc-list-item, [class*="option"]');
-        for (const opt of options) {
-          const text = opt.textContent?.trim();
-          // Match if text starts with model name or first line matches
-          if (text?.startsWith(targetModel) || text?.split('\n')[0]?.trim() === targetModel) {
-            opt.click();
-            return { success: true, model: targetModel };
-          }
-        }
-
-        // Fallback: find any clickable with exact model name at start
-        const allClickables = document.querySelectorAll('button, div[role="option"], div[tabindex], [class*="list-item"]');
-        for (const el of allClickables) {
-          const text = el.textContent?.trim();
-          if (text?.startsWith(targetModel) && el !== dropdownBtn) {
-            el.click();
-            return { success: true, model: targetModel };
-          }
-        }
-        return { error: 'Model option not found: ' + targetModel };
-      },
+      func: selectModelInPage,
       args: [msg.model || 'pro']
     }).then(results => {
       sendResponse(results[0]?.result || { error: 'Script failed' });

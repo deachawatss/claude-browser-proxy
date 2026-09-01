@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Proxy",
-  "version": "26.9.1.829",
+  "version": "26.9.1.926",
   "description": "Control Gemini and Messenger from Claude Code via MQTT",
   "permissions": [
     "activeTab",
@@ -22,13 +22,22 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://gemini.google.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.facebook.com/messages/*", "https://www.messenger.com/*"],
-      "js": ["messenger-content.js"],
+      "matches": [
+        "https://www.facebook.com/messages/*",
+        "https://www.messenger.com/*"
+      ],
+      "js": [
+        "messenger-content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
@@ -47,5 +56,8 @@
   },
   "side_panel": {
     "default_path": "sidepanel.html"
-  }
+  },
+  "optional_host_permissions": [
+    "<all_urls>"
+  ]
 }

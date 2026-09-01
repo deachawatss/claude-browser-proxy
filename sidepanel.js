@@ -241,7 +241,22 @@ $('b3').onclick = async () => {
   if (pub?.ok) log('pub', { ...pub, payload: { ...pub.payload, result: { chars: html.length } } });
 };
 $('b4').onclick = () => cmd('get_videos');
-$('b5').onclick = () => cmd('screenshot');
+$('b5').onclick = async () => {
+  // This click is the only place the all-site permission can be asked for:
+  // chrome.permissions.request needs a real user gesture, and the MQTT path has
+  // none. Optional, so the extension does not carry all-site access from
+  // install, and revocable in chrome://extensions.
+  const has = await chrome.permissions.contains({ origins: ['<all_urls>'] });
+  if (!has) {
+    const granted = await chrome.permissions.request({ origins: ['<all_urls>'] });
+    if (!granted) {
+      log('res', 'Screenshot needs all-site access. Not granted, so nothing was captured.');
+      return;
+    }
+    log('res', 'All-site access granted — screenshots work from the CLI now too.');
+  }
+  cmd('screenshot');
+};
 $('b6').onclick = async () => {
   $('l').innerHTML = '';
   $('ab').style.display = 'none'; // Hide answer box
