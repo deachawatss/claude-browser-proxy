@@ -86,6 +86,17 @@ STATUS=$(timeout 20 mosquitto_sub -h "$HOST" -t claude/browser/status -C 1 -W 10
 check "extension is online" "$STATUS" '"subscribed":true'
 echo "  version: $(printf '%s' "$STATUS" | grep -o '"version":"[^"]*"')"
 
+# Chrome throttles rendering in an unfocused window, so Gemini's Tools menu never
+# finishes opening there and every menu check below times out with an EMPTY
+# response - which reads as a dead bridge, not as a focus problem. That happened
+# on 2026-09-01: 20+ checks failed while get_url answered in milliseconds.
+# Focus the tab deliberately instead of hoping it happens to be in front.
+echo "== focus =="
+PLANNED=$((PLANNED + 1))
+TABID=$(printf '%s' "$(send '{"action":"list_tabs"}' 30)" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+FOCUS=$(send "{\"action\":\"focus_tab\",\"tabId\":${TABID:-0}}" 30)
+check "the Gemini tab is focused (menus will not render otherwise)" "$FOCUS" '"success":true'
+
 echo "== list_modes =="
 MODES=$(send '{"action":"list_modes"}' 45)
 PLANNED=$((PLANNED + 2))

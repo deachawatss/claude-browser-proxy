@@ -101,6 +101,36 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 // the active mode" step failed silently on a cold menu.
 //
 // op is one of: 'list' | 'select' | 'upload' | 'deselect-active'
+// Chrome throttles rendering in a window that is not focused, and Gemini's Tools
+// menu is an overlay that never finishes opening there. Every menuOpInPage caller
+// then waits out its own timeout and answers nothing, which is indistinguishable
+// from a dead bridge.
+//
+// That is not hypothetical: on 2026-09-01 it failed 20+ checks of
+// verify-menu-actions.sh with EMPTY responses while `get_url` answered in
+// milliseconds and the status topic said subscribed:true. The diagnosis cost an
+// hour and two wrong theories (output buffering, then a refactor that turned out
+// to be byte-identical to main). `focus_tab` fixed it in one command.
+//
+// So: say so in one second instead of hanging for ninety. Deliberately NOT
+// auto-focusing - stealing the window from under Wind is the "why you stucking in
+// loop?" failure of 2026-08-31. The caller is told exactly which command fixes it.
+async function menuBlockedByUnfocusedWindow(tab) {
+  let win;
+  try {
+    win = await chrome.windows.get(tab.windowId);
+  } catch (e) {
+    return null; // cannot tell - proceed rather than block on a guess
+  }
+  if (win.focused) return null;
+  return {
+    success: false,
+    error: 'the browser window holding the Gemini tab is not focused, so its Tools menu will not render',
+    fix: `send {"action":"focus_tab","tabId":${tab.id}} first, or click that window`,
+    windowId: tab.windowId,
+  };
+}
+
 // ONE page-side implementation of model selection, for the same reason
 // menuOpInPage exists: an injected function cannot close over module scope, so the
 // only way to share it is for both callers to inject the same function.
@@ -1439,6 +1469,7 @@ Use double newlines between timestamps!`;
 
       case 'list_modes':
       case 'dump_menu': {
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: menuOpInPage,
@@ -1451,6 +1482,7 @@ Use double newlines between timestamps!`;
       case 'upload_file': {
         if (!command.filename) { result = { error: 'upload_file requires "filename"' }; break; }
         if (!command.contentBase64) { result = { error: 'upload_file requires "contentBase64"' }; break; }
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
         // Reject oversize before shipping the string into the page.
         const approxBytes = Math.floor(command.contentBase64.length * 3 / 4);
         if (approxBytes > MAX_UPLOAD_BYTES) {
@@ -1466,7 +1498,8 @@ Use double newlines between timestamps!`;
         break;
       }
 
-      case 'select_mode':
+      case 'select_mode': {
+        { const blocked = await menuBlockedByUnfocusedWindow(tab); if (blocked) { result = blocked; break; } }
         result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: menuOpInPage,
@@ -1474,6 +1507,7 @@ Use double newlines between timestamps!`;
         });
         result = result[0]?.result;
         break;
+      }
 
       case 'chat':
         // SMOOTH: Fast chat - direct text insert + Enter
