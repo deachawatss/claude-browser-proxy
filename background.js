@@ -1209,10 +1209,37 @@ Use double newlines between timestamps!`;
         }
         break;
 
-      case 'screenshot':
-        const dataUrl = await chrome.tabs.captureVisibleTab();
-        result = { screenshot: dataUrl };
+      case 'screenshot': {
+        // Why this needs a permission at all, measured 2026-09-01 in an isolated
+        // browser rather than inferred from the error string:
+        //   host_permissions gemini only, active tab ON gemini -> FAILED
+        //     "Either the '<all_urls>' or 'activeTab' permission is required."
+        //   same, plus <all_urls>                              -> OK, 68091 chars
+        // So a host permission for the exact site is NOT enough - it is a static
+        // check. `activeTab` would also satisfy it, but that is granted only by a
+        // real user gesture, and a command arriving over MQTT has none. Hence
+        // <all_urls>, and hence it being OPTIONAL: Wind grants it with one click
+        // on the side panel's Screenshot button and can revoke it any time in
+        // chrome://extensions. It is not claimed at install.
+        const allowed = await chrome.permissions.contains({ origins: ['<all_urls>'] });
+        if (!allowed) {
+          result = {
+            success: false,
+            error: 'all-site access is not granted, so the tab cannot be captured',
+            fix: 'click Screenshot once in the extension side panel to grant it; revoke any time in chrome://extensions',
+          };
+          break;
+        }
+
+        const shot = await chrome.tabs.captureVisibleTab();
+        // Saved as a file rather than published: a PNG data URL is ~68KB of
+        // base64, and the point is for the caller to LOOK at it, which means it
+        // has to become a file somewhere anyway.
+        const filename = `gemini-proxy/screenshot-${Date.now()}.png`;
+        const shotId = await chrome.downloads.download({ url: shot, filename });
+        result = { success: true, filename, downloadId: shotId, bytes: shot.length };
         break;
+      }
 
       case 'download':
         const dlId = await chrome.downloads.download({
