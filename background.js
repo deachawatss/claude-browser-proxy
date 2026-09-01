@@ -1323,26 +1323,35 @@ Use double newlines between timestamps!`;
         // <all_urls>, and hence it being OPTIONAL: Wind grants it with one click
         // on the side panel's Screenshot button and can revoke it any time in
         // chrome://extensions. It is not claimed at install.
-        const allowed = await chrome.permissions.contains({ origins: ['<all_urls>'] });
-        if (!allowed) {
+        // Attempt the capture and let it be the test. `permissions.contains`
+        // is NOT a reliable pre-check: Chrome's per-extension "Site access"
+        // control can WITHHOLD a granted host permission, and in that state
+        // contains() still answers true while captureVisibleTab fails with
+        //   "The 'activeTab' permission is not in effect because this extension
+        //    has not been invoked."
+        // Measured 2026-09-01, after two captures had already succeeded. A check
+        // that passes while the operation fails is worse than no check.
+        let shot;
+        try {
+          // format:'png' explicitly. The default is JPEG, and chrome.downloads then
+          // corrects the extension to match the real mime type - so the response
+          // announced "screenshot-<ts>.png" while the file on disk was .jpg. PNG is
+          // also the right format for reading UI text, which is what these are for.
+          shot = await chrome.tabs.captureVisibleTab({ format: 'png' });
+        } catch (e) {
+          const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] })
+            .catch(() => null);
           result = {
             success: false,
-            error: 'all-site access is not granted, so the tab cannot be captured',
-            fix: 'click Screenshot once in the extension side panel to grant it; revoke any time in chrome://extensions',
+            error: String(e.message || e),
+            allUrlsGranted: granted,
+            fix: granted
+              ? 'the permission is granted but WITHHELD: chrome://extensions -> Gemini Proxy -> Site access -> On all sites'
+              : 'click Screenshot once in the extension side panel to grant all-site access',
           };
           break;
         }
 
-        // format:'png' explicitly. The default is JPEG, and chrome.downloads then
-        // corrects the extension to match the real mime type - so the response
-        // announced "screenshot-<ts>.png" while the file on disk was .jpg. A
-        // response naming a file that does not exist is the same failure this
-        // repo keeps finding elsewhere; PNG is also the right choice for reading
-        // UI text, which is the whole purpose of the capture.
-        const shot = await chrome.tabs.captureVisibleTab({ format: 'png' });
-        // Saved as a file rather than published: a PNG data URL is ~68KB of
-        // base64, and the point is for the caller to LOOK at it, which means it
-        // has to become a file somewhere anyway.
         const filename = `gemini-proxy/screenshot-${Date.now()}.png`;
         const shotId = await chrome.downloads.download({ url: shot, filename });
         result = { success: true, filename, downloadId: shotId, bytes: shot.length };
