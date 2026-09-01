@@ -180,10 +180,19 @@ if [ "$SKIP_UPLOAD" -eq 0 ]; then
   #   "harness-ok[source: 1]coexist fixture"
   # A suite that dirties the browser and does not verify its own cleanup hands the
   # mess to whoever runs next, and looks green doing it. Issue #17.
+  # A run attaches TWO files - the upload_file fixture and the coexist fixture -
+  # and the old teardown clicked close exactly once, so one always survived. That
+  # is the leftover that ended up in the next chat's answer. Close until none are
+  # left, then prove it.
   PLANNED=$((PLANNED + 1))
-  send '{"action":"click","selector":"button[aria-label^=\"close\" i]"}' 45 > /dev/null
+  for _ in 1 2 3 4 5; do
+    CHIPS=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 30)
+    printf '%s' "$CHIPS" | grep -qF '"found":false' && break
+    send '{"action":"click","selector":"button[aria-label^=\"close\" i]"}' 30 > /dev/null
+    sleep 1
+  done
   CO_GONE=$(send '{"action":"find","selector":"button[aria-label^=\"close\" i]"}' 45)
-  check "the attachment is actually removed at the end" "$CO_GONE" '"found":false'
+  check "every attachment is actually removed at the end" "$CO_GONE" '"found":false'
 fi
 
 echo
